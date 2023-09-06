@@ -1,0 +1,2 @@
+Test-Command: feroxbuster -h
+Restrictions: superficial

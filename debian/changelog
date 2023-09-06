@@ -1,0 +1,137 @@
+feroxbuster (2.10.0-0parrot1) lory; urgency=medium
+
+  * Rebuild for Parrot 6.0.
+
+ -- Lorenzo "Palinuro" Faletra <palinuro@parrotsec.org>  Thu, 07 Sep 2023 01:11:17 +0200
+
+feroxbuster (2.10.0-0kali1) kali-experimental; urgency=medium
+
+  * CI: disable builds on armel and armhf too
+  * CI: Add a note about the current failures
+  * New upstream version 2.10.0
+  * Refresh patches
+
+ -- Sophie Brun <sophie@offensive-security.com>  Tue, 16 May 2023 11:27:43 +0200
+
+feroxbuster (2.9.1-0kali1) kali-experimental; urgency=medium
+
+  [ Kali Janitor ]
+  * Update standards version to 4.6.2, no changes needed.
+
+  [ Sophie Brun ]
+  * New upstream version 2.9.1
+  * Refresh patches
+  * Minimal version of rustc is 1.64
+
+ -- Sophie Brun <sophie@offensive-security.com>  Thu, 23 Mar 2023 14:54:33 +0100
+
+feroxbuster (2.7.3-0kali1) kali-dev; urgency=medium
+
+  * New upstream version 2.7.3
+
+ -- Daniel Ruiz de Alegría <daniruiz@kali.org>  Tue, 03 Jan 2023 16:11:27 +0100
+
+feroxbuster (2.7.2-0kali1) kali-dev; urgency=medium
+
+  * New upstream version 2.7.2
+  * Update patches
+
+ -- Daniel Ruiz de Alegría <daniruiz@kali.org>  Thu, 08 Dec 2022 18:37:41 +0100
+
+feroxbuster (2.7.1-0kali1) kali-dev; urgency=medium
+
+  * New upstream version 2.7.1
+
+ -- Daniel Ruiz de Alegría <daniruiz@kali.org>  Wed, 28 Sep 2022 14:52:07 +0200
+
+feroxbuster (2.7.0-0kali1) kali-dev; urgency=medium
+
+  * New upstream version 2.7.0
+  * Refresh patches
+
+ -- Sophie Brun <sophie@offensive-security.com>  Tue, 19 Apr 2022 09:16:27 +0200
+
+feroxbuster (2.6.4-0kali1) kali-dev; urgency=medium
+
+  * New upstream version 2.6.4
+
+ -- Sophie Brun <sophie@offensive-security.com>  Mon, 11 Apr 2022 17:16:18 +0200
+
+feroxbuster (2.6.1-0kali1) kali-dev; urgency=medium
+
+  * New upstream version 2.6.1
+  * Change CARGO_HOME directory in debian/rules
+  * Refresh patches
+
+ -- Sophie Brun <sophie@offensive-security.com>  Thu, 10 Mar 2022 15:51:46 +0100
+
+feroxbuster (2.5.0-0kali1) kali-dev; urgency=medium
+
+  * New upstream version 2.5.0
+  * Refresh patches
+  * Add a patch to fix a syntax issue
+
+ -- Sophie Brun <sophie@offensive-security.com>  Mon, 07 Feb 2022 14:50:13 +0100
+
+feroxbuster (2.4.1-0kali1) kali-dev; urgency=medium
+
+  * New upstream version 2.4.1
+  * Refresh patches
+
+ -- Sophie Brun <sophie@offensive-security.com>  Thu, 23 Dec 2021 11:18:59 +0100
+
+feroxbuster (2.4.0-0kali2) kali-dev; urgency=medium
+
+  [ Ben Wilson ]
+  * Remove template comment and switch spaces to tabs
+
+  [ Steev Klimaszewski ]
+  * Add patch to remove unneeded semi-colons from macros
+  * Add arm64 as a build target and add libssl-dev build-dep
+
+ -- Arnaud Rebillout <arnaudr@kali.org>  Thu, 09 Dec 2021 21:10:26 +0700
+
+feroxbuster (2.4.0-0kali1) kali-dev; urgency=medium
+
+  * New upstream version 2.4.0
+  * Refresh patches
+  * Bump Standards-Version to 4.6.0
+
+ -- Sophie Brun <sophie@offensive-security.com>  Fri, 22 Oct 2021 11:49:11 +0200
+
+feroxbuster (2.3.3-0kali1) kali-dev; urgency=medium
+
+  * Disable build ci for i386
+  * New upstream version 2.3.3
+  * Refresh patches
+
+ -- Sophie Brun <sophie@offensive-security.com>  Mon, 23 Aug 2021 14:22:46 +0200
+
+feroxbuster (2.3.1-0kali1) kali-dev; urgency=medium
+
+  * New upstream version 2.3.1
+  * Refresh patches
+
+ -- Sophie Brun <sophie@offensive-security.com>  Fri, 09 Jul 2021 15:41:08 +0200
+
+feroxbuster (2.3.0-0kali1) kali-dev; urgency=medium
+
+  [ Kali Janitor ]
+  * Trim trailing whitespace.
+  * Set upstream metadata fields: Bug-Database, Bug-Submit, Repository, Repository-Browse.
+
+  [ Sophie Brun ]
+  * New upstream version 2.3.0
+  * Refresh patches
+  * Use only specific CARGO_HOME during build
+  * Add a patch to improve Makefile
+  * Add seclists in Suggests
+  * Exit with status 0 if --help is used
+
+ -- Sophie Brun <sophie@offensive-security.com>  Fri, 02 Jul 2021 15:36:53 +0200
+
+feroxbuster (2.2.1-0kali1) kali-dev; urgency=medium
+
+  * Initial release
+
+ -- Benjamin 'epi' Risher <epibar052@gmail.com>  Sun, 21 Feb 2021 15:20:48 -0500

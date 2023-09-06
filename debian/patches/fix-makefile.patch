@@ -1,0 +1,27 @@
+From: Benjamin 'epi' Risher <epibar052@gmail.com>
+Date: Wed, 24 Feb 2021 14:33:44 +0100
+Subject: updated makefile
+
+Upstream patch to fix build
+---
+ Makefile | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/Makefile b/Makefile
+index 85e066d..d9a05a8 100644
+--- a/Makefile
++++ b/Makefile
+@@ -27,7 +27,7 @@ endif
+ 
+ TARGET = target/$(RELEASE)
+ 
+-.PHONY: all clean install uninstall test update
++.PHONY: all clean install uninstall test
+ 
+ all: cli
+ cli: $(TARGET)/$(BIN) $(TARGET)/$(BIN).1.gz $(SHR_SOURCES)
+@@ -78,3 +78,4 @@ $(TARGET)/$(BIN): extract
+ $(TARGET)/$(BIN).1.gz: $(TARGET)/$(BIN)
+ 	help2man --no-info $< | gzip -c > $@.partial
+ 	mv $@.partial $@
++

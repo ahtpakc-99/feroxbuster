@@ -1,0 +1,44 @@
+From: Steev Klimaszewski <steev@kali.org>
+Date: Tue, 23 Nov 2021 22:42:24 -0600
+Subject: [PATCH] Remove semi-colons from macros
+
+When compiling on current stable rust, the following message is observed
+
+= warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+= note: for more information, see issue #79813 <https://github.com/rust-lang/rust/issues/79813>
+
+This ends up producing 70 warnings, so get rid of the semi-colons since they aren't needed.
+---
+ src/statistics/macros.rs | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/src/statistics/macros.rs b/src/statistics/macros.rs
+index aa8d81f..d698189 100644
+--- a/src/statistics/macros.rs
++++ b/src/statistics/macros.rs
+@@ -6,11 +6,11 @@
+ #[macro_export]
+ macro_rules! atomic_increment {
+     ($metric:expr) => {
+-        $metric.fetch_add(1, Ordering::Relaxed);
++        $metric.fetch_add(1, Ordering::Relaxed)
+     };
+ 
+     ($metric:expr, $value:expr) => {
+-        $metric.fetch_add($value, Ordering::Relaxed);
++        $metric.fetch_add($value, Ordering::Relaxed)
+     };
+ }
+ 
+@@ -29,9 +29,9 @@ macro_rules! atomic_load {
+ #[macro_export]
+ macro_rules! atomic_store {
+     ($metric:expr, $value:expr) => {
+-        $metric.store($value, Ordering::Relaxed);
++        $metric.store($value, Ordering::Relaxed)
+     };
+     ($metric:expr, $value:expr, $ordering:expr) => {
+-        $metric.store($value, $ordering);
++        $metric.store($value, $ordering)
+     };
+ }
