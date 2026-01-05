@@ -22,6 +22,7 @@ pub mod progress;
 pub mod scan_manager;
 pub mod scanner;
 pub mod statistics;
+pub mod sync;
 mod traits;
 pub mod utils;
 mod extractor;
@@ -53,10 +54,183 @@ pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const DEFAULT_OPEN_FILE_LIMIT: u64 = 8192;
 
 /// Default set of extensions to Ignore when auto-collecting extensions during scans
-pub(crate) const DEFAULT_IGNORED_EXTENSIONS: [&str; 38] = [
-    "tif", "tiff", "ico", "cur", "bmp", "webp", "svg", "png", "jpg", "jpeg", "jfif", "gif", "avif",
-    "apng", "pjpeg", "pjp", "mov", "wav", "mpg", "mpeg", "mp3", "mp4", "m4a", "m4p", "m4v", "ogg",
-    "webm", "ogv", "oga", "flac", "aac", "3gp", "css", "zip", "xls", "xml", "gz", "tgz",
+pub(crate) const DEFAULT_IGNORED_EXTENSIONS: [&str; 43] = [
+    "woff2", "woff", "ttf", "otf", "eot", "tif", "tiff", "ico", "cur", "bmp", "webp", "svg", "png",
+    "jpg", "jpeg", "jfif", "gif", "avif", "apng", "pjpeg", "pjp", "mov", "wav", "mpg", "mpeg",
+    "mp3", "mp4", "m4a", "m4p", "m4v", "ogg", "webm", "ogv", "oga", "flac", "aac", "3gp", "css",
+    "zip", "xls", "xml", "gz", "tgz",
+];
+
+/// Default set of extensions to search for when auto-collecting backups during scans
+pub(crate) const DEFAULT_BACKUP_EXTENSIONS: [&str; 5] = ["~", ".bak", ".bak2", ".old", ".1"];
+
+/// list of common file extensions for link density detection in directory listings
+/// based on https://www.computerhope.com/issues/ch001789.htm
+pub(crate) const COMMON_FILE_EXTENSIONS: [&str; 154] = [
+    // Web & Documents
+    ".html",
+    ".htm",
+    ".php",
+    ".asp",
+    ".aspx",
+    ".jsp",
+    ".jspx",
+    ".cgi",
+    ".pl",
+    ".py",
+    ".rb",
+    ".lua",
+    ".txt",
+    ".pdf",
+    ".doc",
+    ".docx",
+    ".xls",
+    ".xlsx",
+    ".ppt",
+    ".pptx",
+    ".odt",
+    ".ods",
+    ".odp",
+    ".rtf",
+    ".tex",
+    ".md",
+    ".csv",
+    // Programming & Scripts
+    ".js",
+    ".mjs",
+    ".ts",
+    ".jsx",
+    ".tsx",
+    ".css",
+    ".scss",
+    ".sass",
+    ".less",
+    ".java",
+    ".class",
+    ".jar",
+    ".c",
+    ".cpp",
+    ".h",
+    ".hpp",
+    ".cs",
+    ".vb",
+    ".go",
+    ".rs",
+    ".swift",
+    ".kt",
+    ".scala",
+    ".r",
+    ".m",
+    ".mm",
+    ".f",
+    ".f90",
+    ".pas",
+    ".asm",
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".fish",
+    ".bat",
+    ".cmd",
+    ".ps1",
+    ".psm1",
+    // Data & Config
+    ".xml",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".ini",
+    ".conf",
+    ".config",
+    ".cfg",
+    ".properties",
+    ".env",
+    ".sql",
+    ".db",
+    ".sqlite",
+    ".mdb",
+    ".accdb",
+    // Archives & Compressed
+    ".zip",
+    ".rar",
+    ".7z",
+    ".tar",
+    ".gz",
+    ".bz2",
+    ".xz",
+    ".tgz",
+    ".tbz2",
+    ".cab",
+    ".dmg",
+    ".iso",
+    ".img",
+    // Executables & Libraries
+    ".exe",
+    ".dll",
+    ".so",
+    ".dylib",
+    ".app",
+    ".deb",
+    ".rpm",
+    ".apk",
+    ".msi",
+    // Images
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".bmp",
+    ".svg",
+    ".webp",
+    ".ico",
+    ".tif",
+    ".tiff",
+    ".psd",
+    ".ai",
+    ".eps",
+    ".raw",
+    ".cr2",
+    ".nef",
+    // Audio
+    ".mp3",
+    ".wav",
+    ".flac",
+    ".aac",
+    ".ogg",
+    ".wma",
+    ".m4a",
+    ".opus",
+    ".aiff",
+    // Video
+    ".mp4",
+    ".avi",
+    ".mkv",
+    ".mov",
+    ".wmv",
+    ".flv",
+    ".webm",
+    ".m4v",
+    ".mpg",
+    ".mpeg",
+    ".3gp",
+    ".ogv",
+    // Fonts
+    ".ttf",
+    ".otf",
+    ".woff",
+    ".woff2",
+    ".eot",
+    // Backups & Logs
+    ".log",
+    ".bak",
+    ".tmp",
+    ".temp",
+    ".swp",
+    ".swo",
+    ".old",
+    ".orig",
+    ".backup",
 ];
 
 /// Default wordlist to use when `-w|--wordlist` isn't specified and not `wordlist` isn't set
@@ -173,6 +347,15 @@ pub const USER_AGENTS: [&str; 12] = [
     "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)",
     "Mozilla/5.0 (compatible; Yahoo! Slurp; http://help.yahoo.com/help/us/ysearch/slurp)",
 ];
+
+/// maximum hamming distance allowed between two simhash signatures when detecting near-duplicates
+///
+/// ref: https://static.googleusercontent.com/media/research.google.com/en//pubs/archive/33026.pdf
+/// section: 4.1 Choice of Parameters
+pub(crate) const NEAR_DUPLICATE_DISTANCE: usize = 3;
+
+/// maximum hamming distance allowed between two simhash signatures when unique'ifying responses
+pub(crate) const UNIQUE_DISTANCE: usize = 1;
 
 #[cfg(test)]
 mod tests {

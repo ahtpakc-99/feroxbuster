@@ -1,13 +1,14 @@
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::mpsc;
 
 use crate::{
     response::FeroxResponse,
     scan_manager::{FeroxScan, FeroxScans, ScanOrder},
     scanner::{FeroxScanner, RESPONSES},
     statistics::StatField::TotalScans,
+    sync::DynamicSemaphore,
     url::FeroxUrl,
     utils::should_deny_url,
     CommandReceiver, CommandSender, FeroxChannel, Joiner, SLEEP_DURATION,
@@ -68,7 +69,7 @@ pub struct ScanHandler {
     depths: Vec<(String, usize)>,
 
     /// Bounded semaphore used as a barrier to limit concurrent scans
-    limiter: Arc<Semaphore>,
+    limiter: Arc<DynamicSemaphore>,
 }
 
 /// implementation of event handler for filters
@@ -81,7 +82,7 @@ impl ScanHandler {
         receiver: CommandReceiver,
     ) -> Self {
         let limit = handles.config.scan_limit;
-        let limiter = Semaphore::new(limit);
+        let limiter = DynamicSemaphore::new(limit);
 
         if limit == 0 {
             // scan_limit == 0 means no limit should be imposed... however, scoping the Semaphore
@@ -91,7 +92,7 @@ impl ScanHandler {
             // note to self: the docs say max is usize::MAX >> 3, however, threads will panic if
             // that value is used (says adding (1) will overflow the semaphore, even though none
             // are being added...)
-            limiter.add_permits(usize::MAX >> 4);
+            limiter.increase_capacity(usize::MAX >> 4);
         }
 
         Self {
@@ -110,7 +111,7 @@ impl ScanHandler {
     fn wordlist(&self, wordlist: Arc<Vec<String>>) {
         if let Ok(mut guard) = self.wordlist.lock() {
             if guard.is_none() {
-                let _ = std::mem::replace(&mut *guard, Some(wordlist));
+                guard.replace(wordlist);
             }
         }
     }
@@ -120,7 +121,10 @@ impl ScanHandler {
     pub fn initialize(handles: Arc<Handles>) -> (Joiner, ScanHandle) {
         log::trace!("enter: initialize");
 
-        let data = Arc::new(FeroxScans::new(handles.config.output_level));
+        let data = Arc::new(FeroxScans::new(
+            handles.config.output_level,
+            handles.config.limit_bars,
+        ));
         let (tx, rx): FeroxChannel<Command> = mpsc::unbounded_channel();
 
         let max_depth = handles.config.depth;
@@ -131,7 +135,7 @@ impl ScanHandler {
 
         let event_handle = ScanHandle::new(data, tx);
 
-        log::trace!("exit: initialize -> ({:?}, {:?})", task, event_handle);
+        log::trace!("exit: initialize -> ({task:?}, {event_handle:?})");
 
         (task, event_handle)
     }
@@ -140,7 +144,7 @@ impl ScanHandler {
     ///
     /// The consumer simply receives `Command` and acts accordingly
     pub async fn start(&mut self) -> Result<()> {
-        log::trace!("enter: start({:?})", self);
+        log::trace!("enter: start({self:?})");
 
         while let Some(command) = self.receiver.recv().await {
             match command {
@@ -194,6 +198,24 @@ impl ScanHandler {
                             .unwrap_or_default();
                     }
                 }
+                Command::AddScanPermits(value) => {
+                    let current = self.limiter.current_capacity();
+
+                    self.limiter.increase_capacity(current + value);
+
+                    log::debug!(
+                        "increased scan permits to {} (was {current})",
+                        current + value
+                    );
+                }
+                Command::SubtractScanPermits(value) => {
+                    let current = self.limiter.current_capacity();
+                    let new_capacity = current.saturating_sub(value);
+
+                    self.limiter.reduce_capacity(new_capacity);
+
+                    log::debug!("decreased scan permits to {new_capacity} (was {current})");
+                }
                 _ => {} // no other commands needed for RecursionHandler
             }
         }
@@ -206,12 +228,12 @@ impl ScanHandler {
     ///
     /// updating all bar lengths correctly requires a few different actions on our part.
     /// - get the current number of requests expected per scan (dynamic when --collect-extensions
-    ///     is used)
+    ///   is used)
     /// - update the overall progress bar via the statistics handler (total expected)
     /// - update the expected per scan value tracked in the statistics handler
     /// - update progress bars on each FeroxScan (type::directory) that are running/not-started
     /// - update progress bar length on FeroxScans (this is used when creating new a FeroxScan and
-    ///     determines the new scan's progress bar length)
+    ///   determines the new scan's progress bar length)
     fn update_all_bar_lengths(&self) -> Result<()> {
         log::trace!("enter: update_all_bar_lengths");
 
@@ -306,7 +328,7 @@ impl ScanHandler {
 
     /// wrapper around scanning a url to stay DRY
     async fn ordered_scan_url(&mut self, targets: Vec<String>, order: ScanOrder) -> Result<()> {
-        log::trace!("enter: ordered_scan_url({:?}, {:?})", targets, order);
+        log::trace!("enter: ordered_scan_url({targets:?}, {order:?})");
         let should_test_deny = !self.handles.config.url_denylist.is_empty()
             || !self.handles.config.regex_denylist.is_empty();
 
@@ -322,7 +344,9 @@ impl ScanHandler {
             let scan = if let Some(ferox_scan) = self.data.get_scan_by_url(&target) {
                 ferox_scan // scan already known
             } else {
-                self.data.add_directory_scan(&target, order).1 // add the new target; return FeroxScan
+                self.data
+                    .add_directory_scan(&target, order, self.handles.clone())
+                    .1 // add the new target; return FeroxScan
             };
 
             if should_test_deny
@@ -347,7 +371,7 @@ impl ScanHandler {
                 self.get_wordlist(scan.requests_made_so_far() as usize)?
             };
 
-            log::info!("scan handler received {} - beginning scan", target);
+            log::info!("scan handler received {target} - beginning scan");
 
             if matches!(order, ScanOrder::Initial) {
                 // keeps track of the initial targets' scan depths in order to enforce the
@@ -367,7 +391,7 @@ impl ScanHandler {
 
             let task = tokio::spawn(async move {
                 if let Err(e) = scanner.scan_url().await {
-                    log::warn!("{}", e);
+                    log::warn!("{e}");
                 }
             });
 
@@ -383,7 +407,7 @@ impl ScanHandler {
     }
 
     async fn try_recursion(&mut self, response: Box<FeroxResponse>) -> Result<()> {
-        log::trace!("enter: try_recursion({:?})", response,);
+        log::trace!("enter: try_recursion({response:?})",);
 
         if !self.handles.config.force_recursion && !response.is_directory() {
             // not a directory and --force-recursion wasn't used, quick exit

@@ -153,6 +153,39 @@ fn banner_prints_denied_urls() {
 
 #[test]
 /// test allows non-existent wordlist to trigger the banner printing to stderr
+/// expect to see all mandatory prints + multiple scope url entries
+fn banner_prints_scope_urls() {
+    Command::cargo_bin("feroxbuster")
+        .unwrap()
+        .arg("--url")
+        .arg("http://localhost")
+        .arg("--scope")
+        .arg("example.com")
+        .arg("api.example.com")
+        .arg("sub.example.com")
+        .arg("--wordlist")
+        .arg("/definitely/doesnt/exist/0cd7fed0-47f4-4b18-a1b0-ac39708c1676")
+        .assert()
+        .success()
+        .stderr(
+            predicate::str::contains("─┬─")
+                .and(predicate::str::contains("Target Url"))
+                .and(predicate::str::contains("http://localhost"))
+                .and(predicate::str::contains("Threads"))
+                .and(predicate::str::contains("Wordlist"))
+                .and(predicate::str::contains("Status Codes"))
+                .and(predicate::str::contains("Timeout (secs)"))
+                .and(predicate::str::contains("User-Agent"))
+                .and(predicate::str::contains("In-Scope Url"))
+                .and(predicate::str::contains("example.com"))
+                .and(predicate::str::contains("api.example.com"))
+                .and(predicate::str::contains("sub.example.com"))
+                .and(predicate::str::contains("─┴─")),
+        );
+}
+
+#[test]
+/// test allows non-existent wordlist to trigger the banner printing to stderr
 /// expect to see all mandatory prints + multiple headers
 fn banner_prints_random_agent() {
     Command::cargo_bin("feroxbuster")
@@ -830,6 +863,35 @@ fn banner_prints_scan_limit() {
 
 #[test]
 /// test allows non-existent wordlist to trigger the banner printing to stderr
+/// expect to see all mandatory prints + response-size-limit
+fn banner_prints_response_size_limit() {
+    Command::cargo_bin("feroxbuster")
+        .unwrap()
+        .arg("--url")
+        .arg("http://localhost")
+        .arg("--response-size-limit")
+        .arg("8388608") // 8MB
+        .arg("--wordlist")
+        .arg("/definitely/doesnt/exist/0cd7fed0-47f4-4b18-a1b0-ac39708c1676")
+        .assert()
+        .success()
+        .stderr(
+            predicate::str::contains("─┬─")
+                .and(predicate::str::contains("Target Url"))
+                .and(predicate::str::contains("http://localhost"))
+                .and(predicate::str::contains("Threads"))
+                .and(predicate::str::contains("Wordlist"))
+                .and(predicate::str::contains("Status Codes"))
+                .and(predicate::str::contains("Timeout (secs)"))
+                .and(predicate::str::contains("User-Agent"))
+                .and(predicate::str::contains("Response Size Limit"))
+                .and(predicate::str::contains("8388608 bytes"))
+                .and(predicate::str::contains("─┴─")),
+        );
+}
+
+#[test]
+/// test allows non-existent wordlist to trigger the banner printing to stderr
 /// expect to see all mandatory prints + filter-status
 fn banner_prints_filter_status() {
     Command::cargo_bin("feroxbuster")
@@ -1146,6 +1208,7 @@ fn banner_prints_parallel() {
     Command::cargo_bin("feroxbuster")
         .unwrap()
         .arg("--stdin")
+        .arg("--quiet")
         .arg("--parallel")
         .arg("4316")
         .arg("--wordlist")
@@ -1434,6 +1497,130 @@ fn banner_prints_all_composite_settings_burp() {
 #[test]
 /// test allows non-existent wordlist to trigger the banner printing to stderr
 /// expect to see all mandatory prints + collect words
+fn banner_prints_all_composite_settings_data_json_stdin() {
+    Command::cargo_bin("feroxbuster")
+        .unwrap()
+        .arg("--url")
+        .arg("http://localhost")
+        .arg("--data-json")
+        .arg(r#"{"some":"payload"}"#)
+        .arg("--wordlist")
+        .arg("/definitely/doesnt/exist/0cd7fed0-47f4-4b18-a1b0-ac39708c1676")
+        .assert()
+        .success()
+        .stderr(
+            predicate::str::contains("─┬─")
+                .and(predicate::str::contains("Target Url"))
+                .and(predicate::str::contains(r#"{"some":"payload"}"#))
+                .and(predicate::str::contains("http://localhost"))
+                .and(predicate::str::contains("Threads"))
+                .and(predicate::str::contains("Wordlist"))
+                .and(predicate::str::contains("Status Codes"))
+                .and(predicate::str::contains("Timeout (secs)"))
+                .and(predicate::str::contains("User-Agent"))
+                .and(predicate::str::contains("Content-Type: application/json"))
+                .and(predicate::str::contains("─┴─")),
+        );
+}
+
+#[test]
+fn banner_prints_all_composite_settings_data_json_file() {
+    Command::cargo_bin("feroxbuster")
+        .unwrap()
+        .arg("--url")
+        .arg("http://localhost")
+        .arg("-m")
+        .arg("PUT")
+        .arg("--data-json")
+        .arg("@tests/payloads/simple.json")
+        .arg("--wordlist")
+        .arg("/definitely/doesnt/exist/0cd7fed0-47f4-4b18-a1b0-ac39708c1676")
+        .assert()
+        .success()
+        .stderr(
+            predicate::str::contains("─┬─")
+                .and(predicate::str::contains("Target Url"))
+                .and(predicate::str::contains(r#"{     "some": "payload","#))
+                .and(predicate::str::contains("http://localhost"))
+                .and(predicate::str::contains("Threads"))
+                .and(predicate::str::contains("Wordlist"))
+                .and(predicate::str::contains("Status Codes"))
+                .and(predicate::str::contains("[PUT]"))
+                .and(predicate::str::contains("Timeout (secs)"))
+                .and(predicate::str::contains("User-Agent"))
+                .and(predicate::str::contains("Content-Type: application/json"))
+                .and(predicate::str::contains("─┴─")),
+        );
+}
+
+#[test]
+fn banner_prints_all_composite_settings_data_urlencoded_stdin() {
+    Command::cargo_bin("feroxbuster")
+        .unwrap()
+        .arg("--url")
+        .arg("http://localhost")
+        .arg("-m")
+        .arg("PUT")
+        .arg("--data-urlencoded")
+        .arg("some=payload")
+        .arg("--wordlist")
+        .arg("/definitely/doesnt/exist/0cd7fed0-47f4-4b18-a1b0-ac39708c1676")
+        .assert()
+        .success()
+        .stderr(
+            // TODO : test POST and file reading
+            predicate::str::contains("─┬─")
+                .and(predicate::str::contains("Target Url"))
+                .and(predicate::str::contains("some%3Dpayload"))
+                .and(predicate::str::contains("http://localhost"))
+                .and(predicate::str::contains("Threads"))
+                .and(predicate::str::contains("Wordlist"))
+                .and(predicate::str::contains("[PUT]"))
+                .and(predicate::str::contains("Status Codes"))
+                .and(predicate::str::contains("Timeout (secs)"))
+                .and(predicate::str::contains("User-Agent"))
+                .and(predicate::str::contains(
+                    "Content-Type: application/x-www-form-urlencoded",
+                ))
+                .and(predicate::str::contains("─┴─")),
+        );
+}
+
+#[test]
+/// test allows non-existent wordlist to trigger the banner printing to stderr
+/// expect to see all mandatory prints + collect words
+fn banner_prints_all_composite_settings_data_urlencoded_file() {
+    Command::cargo_bin("feroxbuster")
+        .unwrap()
+        .arg("--url")
+        .arg("http://localhost")
+        .arg("--data-urlencoded")
+        .arg("@tests/payloads/simple.key.value")
+        .arg("--wordlist")
+        .arg("/definitely/doesnt/exist/0cd7fed0-47f4-4b18-a1b0-ac39708c1676")
+        .assert()
+        .success()
+        .stderr(
+            // TODO : test POST and file reading
+            predicate::str::contains("─┬─")
+                .and(predicate::str::contains("Target Url"))
+                .and(predicate::str::contains("some%3Dpayload%26and%3D1"))
+                .and(predicate::str::contains("http://localhost"))
+                .and(predicate::str::contains("Threads"))
+                .and(predicate::str::contains("Wordlist"))
+                .and(predicate::str::contains("Status Codes"))
+                .and(predicate::str::contains("Timeout (secs)"))
+                .and(predicate::str::contains("User-Agent"))
+                .and(predicate::str::contains(
+                    "Content-Type: application/x-www-form-urlencoded",
+                ))
+                .and(predicate::str::contains("─┴─")),
+        );
+}
+
+#[test]
+/// test allows non-existent wordlist to trigger the banner printing to stderr
+/// expect to see all mandatory prints + collect words
 fn banner_prints_all_composite_settings_burp_replay() {
     Command::cargo_bin("feroxbuster")
         .unwrap()
@@ -1488,6 +1675,61 @@ fn banner_prints_force_recursion() {
 
 #[test]
 /// test allows non-existent wordlist to trigger the banner printing to stderr
+/// expect to see all mandatory prints + scan-dir-listings
+fn banner_prints_scan_dir_listings() {
+    Command::cargo_bin("feroxbuster")
+        .unwrap()
+        .arg("--url")
+        .arg("http://localhost")
+        .arg("--scan-dir-listings")
+        .arg("--wordlist")
+        .arg("/definitely/doesnt/exist/0cd7fed0-47f4-4b18-a1b0-ac39708c1676")
+        .assert()
+        .success()
+        .stderr(
+            predicate::str::contains("─┬─")
+                .and(predicate::str::contains("Target Url"))
+                .and(predicate::str::contains("http://localhost"))
+                .and(predicate::str::contains("Threads"))
+                .and(predicate::str::contains("Wordlist"))
+                .and(predicate::str::contains("Status Codes"))
+                .and(predicate::str::contains("Timeout (secs)"))
+                .and(predicate::str::contains("User-Agent"))
+                .and(predicate::str::contains("Scan Dir Listings"))
+                .and(predicate::str::contains("─┴─")),
+        );
+}
+
+#[test]
+/// test allows non-existent wordlist to trigger the banner printing to stderr
+/// expect to see all mandatory prints + protocol
+fn banner_prints_limit_dirs() {
+    Command::cargo_bin("feroxbuster")
+        .unwrap()
+        .arg("--url")
+        .arg("localhost")
+        .arg("--limit-bars")
+        .arg("3")
+        .arg("--wordlist")
+        .arg("/definitely/doesnt/exist/0cd7fed0-47f4-4b18-a1b0-ac39708c1676")
+        .assert()
+        .success()
+        .stderr(
+            predicate::str::contains("─┬─")
+                .and(predicate::str::contains("Target Url"))
+                .and(predicate::str::contains("http://localhost"))
+                .and(predicate::str::contains("Threads"))
+                .and(predicate::str::contains("Wordlist"))
+                .and(predicate::str::contains("Status Codes"))
+                .and(predicate::str::contains("Timeout (secs)"))
+                .and(predicate::str::contains("User-Agent"))
+                .and(predicate::str::contains("Limit Dir Scan Bars"))
+                .and(predicate::str::contains("─┴─")),
+        );
+}
+
+#[test]
+/// test allows non-existent wordlist to trigger the banner printing to stderr
 /// expect to see all mandatory prints + force recursion
 fn banner_prints_update_app() {
     Command::cargo_bin("feroxbuster")
@@ -1496,4 +1738,32 @@ fn banner_prints_update_app() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Checking target-arch..."));
+}
+
+#[test]
+/// test allows non-existent wordlist to trigger the banner printing to stderr
+/// expect to see all mandatory prints + unique
+fn banner_prints_unique() {
+    Command::cargo_bin("feroxbuster")
+        .unwrap()
+        .arg("--url")
+        .arg("http://localhost")
+        .arg("--unique")
+        .arg("--wordlist")
+        .arg("/definitely/doesnt/exist/0cd7fed0-47f4-4b18-a1b0-ac39708c1676")
+        .assert()
+        .success()
+        .stderr(
+            predicate::str::contains("─┬─")
+                .and(predicate::str::contains("Target Url"))
+                .and(predicate::str::contains("http://localhost"))
+                .and(predicate::str::contains("Threads"))
+                .and(predicate::str::contains("Wordlist"))
+                .and(predicate::str::contains("Status Codes"))
+                .and(predicate::str::contains("Timeout (secs)"))
+                .and(predicate::str::contains("User-Agent"))
+                .and(predicate::str::contains("Unique Responses"))
+                .and(predicate::str::contains("true"))
+                .and(predicate::str::contains("─┴─")),
+        );
 }

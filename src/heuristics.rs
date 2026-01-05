@@ -1,14 +1,15 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
+use console::style;
 use futures::future;
+use lazy_static::lazy_static;
 use scraper::{Html, Selector};
 use uuid::Uuid;
 
-use crate::filters::{SimilarityFilter, WildcardFilter, SIM_HASHER};
+use crate::filters::{SimilarityFilter, WildcardFilter};
 use crate::message::FeroxMessage;
-use crate::nlp::preprocess;
 use crate::scanner::RESPONSES;
 use crate::{
     config::OutputLevel,
@@ -18,8 +19,25 @@ use crate::{
     skip_fail,
     url::FeroxUrl,
     utils::{ferox_print, fmt_err, logged_request},
-    DEFAULT_METHOD,
+    COMMON_FILE_EXTENSIONS, DEFAULT_BACKUP_EXTENSIONS, DEFAULT_METHOD,
 };
+
+lazy_static! {
+    /// Pre-built HashSet of file extensions for O(1) lookup in directory listing detection
+    /// Combines COMMON_FILE_EXTENSIONS and DEFAULT_BACKUP_EXTENSIONS
+    static ref FILE_EXTENSION_SET: HashSet<&'static str> = {
+        let mut set = HashSet::with_capacity(
+            COMMON_FILE_EXTENSIONS.len() + DEFAULT_BACKUP_EXTENSIONS.len()
+        );
+        for ext in COMMON_FILE_EXTENSIONS.iter() {
+            set.insert(*ext);
+        }
+        for ext in DEFAULT_BACKUP_EXTENSIONS.iter() {
+            set.insert(*ext);
+        }
+        set
+    };
+}
 
 /// enum representing the different servers that `parse_html` can detect when directory listing is
 /// enabled
@@ -33,6 +51,9 @@ pub enum DirListingType {
 
     /// ASP.NET server, detected by `Directory Listing -- /`
     AspDotNet,
+
+    /// custom/non-standard directory listing, detected by high-signal heuristics
+    Custom,
 
     // /// IIS/Azure server, detected by `HOST_NAME - /` (not currently used)
     // IIS_AZURE,
@@ -80,7 +101,7 @@ impl HeuristicTests {
     /// is 32 characters long. So, a length of 1 return a 32 character string,
     /// a length of 2 returns a 64 character string, and so on...
     fn unique_string(&self, length: usize) -> String {
-        log::trace!("enter: unique_string({})", length);
+        log::trace!("enter: unique_string({length})");
         let mut ids = vec![];
 
         for _ in 0..length {
@@ -89,7 +110,7 @@ impl HeuristicTests {
 
         let unique_id = ids.join("");
 
-        log::trace!("exit: unique_string -> {}", unique_id);
+        log::trace!("exit: unique_string -> {unique_id}");
         unique_id
     }
 
@@ -99,7 +120,7 @@ impl HeuristicTests {
     ///
     /// Any urls that are found to be alive are returned to the caller.
     pub async fn connectivity(&self, target_urls: &[String]) -> Result<Vec<String>> {
-        log::trace!("enter: connectivity_test({:?})", target_urls);
+        log::trace!("enter: connectivity_test({target_urls:?})");
 
         let mut good_urls = vec![];
 
@@ -119,10 +140,8 @@ impl HeuristicTests {
                         OutputLevel::Default | OutputLevel::Quiet
                     ) {
                         if e.to_string().contains(":SSL") {
-                            ferox_print(
-                                &format!("Could not connect to {target_url} due to SSL errors (run with -k to ignore), skipping...\n  => {}\n", e.root_cause()),
-                                &PROGRESS_PRINTER,
-                            );
+                            let msg = format!("Could not connect to {target_url} due to {} errors (run with {} to ignore), skipping...\n  => {}\n",style("SSL").red(), style("--insecure").yellow().bright(), e.root_cause());
+                            ferox_print(&msg, &PROGRESS_PRINTER);
                         } else {
                             ferox_print(
                                 &format!(
@@ -133,7 +152,7 @@ impl HeuristicTests {
                             );
                         }
                     }
-                    log::warn!("{}", e);
+                    log::warn!("{e}");
                 }
             }
         }
@@ -142,13 +161,13 @@ impl HeuristicTests {
             bail!("Could not connect to any target provided");
         }
 
-        log::trace!("exit: connectivity_test -> {:?}", good_urls);
+        log::trace!("exit: connectivity_test -> {good_urls:?}");
         Ok(good_urls)
     }
 
     /// heuristic designed to detect when a server has directory listing enabled
     pub async fn directory_listing(&self, target_url: &str) -> Result<Option<DirListingResult>> {
-        log::trace!("enter: directory_listing({})", target_url);
+        log::trace!("enter: directory_listing({target_url})");
 
         let tgt = if !target_url.ends_with('/') {
             // if left unchanged, this function would be called against redirects that point to
@@ -171,22 +190,21 @@ impl HeuristicTests {
             &url.target,
             DEFAULT_METHOD,
             self.handles.config.output_level,
+            self.handles.config.response_size_limit,
         )
         .await;
 
         let body = ferox_response.text();
         let html = Html::parse_document(body);
 
-        let dirlist_type = self.detect_directory_listing(&html);
-
-        if dirlist_type.is_some() {
+        if let Some(dir_type) = self.detect_directory_listing(&html) {
             // folks that run things and step away/rely on logs need to be notified of directory
             // listing, since they won't see the message on the bar; bastardizing FeroxMessage
             // for ease of implementation. This could use a bit of polish at some point.
+
             let msg = format!(
                 "detected directory listing: {} ({:?})",
-                target_url,
-                dirlist_type.unwrap()
+                target_url, dir_type
             );
             let ferox_msg = FeroxMessage {
                 kind: "log".to_string(),
@@ -201,14 +219,14 @@ impl HeuristicTests {
                 .send(Command::WriteToDisk(Box::new(ferox_msg)))
                 .unwrap_or_default();
 
-            log::info!("{}", msg);
+            log::info!("{msg}");
 
             let result = DirListingResult {
-                dir_list_type: dirlist_type,
+                dir_list_type: Some(dir_type),
                 response: ferox_response,
             };
 
-            log::trace!("exit: directory_listing -> {:?}", result);
+            log::trace!("exit: directory_listing -> {result:?}");
             return Ok(Some(result));
         }
 
@@ -222,10 +240,11 @@ impl HeuristicTests {
     /// - tomcat/python: `Directory Listing for /`
     /// - ASP.NET: `Directory Listing -- /`
     /// - <host> - /: iis, azure, skipping due to loose heuristic
+    /// - custom: detected by combining multiple high-signal heuristics
     fn detect_directory_listing(&self, html: &Html) -> Option<DirListingType> {
         log::trace!("enter: detect_directory_listing(html body...)");
 
-        let title_selector = Selector::parse("title").expect("couldn't parse title selector");
+        let title_selector = Selector::parse("title").ok()?;
 
         for t in html.select(&title_selector) {
             let title = t.inner_html().to_lowercase();
@@ -242,13 +261,231 @@ impl HeuristicTests {
             };
 
             if dirlist_type.is_some() {
-                log::trace!("exit: detect_directory_listing -> {:?}", dirlist_type);
+                log::trace!("exit: detect_directory_listing -> {dirlist_type:?}");
                 return dirlist_type;
             }
         }
 
+        // If no standard title-based detection, try high-signal custom heuristics
+        let has_parent_link = self.has_parent_directory_link(html);
+        let has_table_headers = self.has_directory_table_headers(html);
+        let has_sorting_params = self.has_sorting_query_params(html);
+        let has_link_density = self.has_high_link_density(html);
+
+        let signal_count = [
+            has_parent_link,
+            has_table_headers,
+            has_sorting_params,
+            has_link_density,
+        ]
+        .iter()
+        .filter(|&&x| x)
+        .count();
+
+        if signal_count >= 2 {
+            let mut signals = Vec::new();
+            if has_parent_link {
+                signals.push("parent-link");
+            }
+            if has_table_headers {
+                signals.push("table-headers");
+            }
+            if has_sorting_params {
+                signals.push("sorting-params");
+            }
+            if has_link_density {
+                signals.push("link-density");
+            }
+            log::debug!("custom directory listing signals: [{}]", signals.join(", "));
+            log::trace!("exit: detect_directory_listing -> Some(Custom)");
+            return Some(DirListingType::Custom);
+        }
+
         log::trace!("exit: detect_directory_listing -> None");
         None
+    }
+
+    /// check if the HTML contains a link to the parent directory
+    ///
+    /// returns true if any anchor element has:
+    /// - href equals "../" or ".."
+    /// - visible text contains "parent directory", "to parent", or "up to parent"
+    fn has_parent_directory_link(&self, html: &Html) -> bool {
+        log::trace!("enter: has_parent_directory_link");
+
+        let Some(anchor_selector) = Selector::parse("a").ok() else {
+            log::warn!("failed to parse anchor selector in has_parent_directory_link");
+            return false;
+        };
+
+        for anchor in html.select(&anchor_selector) {
+            if let Some(href) = anchor.value().attr("href") {
+                let href_lower = href.trim().to_lowercase();
+                if href_lower == "../" || href_lower == ".." {
+                    log::trace!("exit: has_parent_directory_link -> true (href match)");
+                    return true;
+                }
+            }
+
+            let text = anchor.text().collect::<String>().to_lowercase();
+            let text_trimmed = text.trim();
+            if text_trimmed.contains("parent directory")
+                || text_trimmed.contains("to parent")
+                || text_trimmed.contains("up to parent")
+            {
+                log::trace!("exit: has_parent_directory_link -> true (text match)");
+                return true;
+            }
+        }
+
+        log::trace!("exit: has_parent_directory_link -> false");
+        false
+    }
+
+    /// check if the HTML contains table headers typical of directory listings
+    ///
+    /// returns true if at least two of the following header categories are present:
+    /// - name headers: "file name", "filename", "name"
+    /// - size headers: "size", "file size"
+    /// - time headers: "date", "last modified", "modified", "last mod"
+    fn has_directory_table_headers(&self, html: &Html) -> bool {
+        log::trace!("enter: has_directory_table_headers");
+
+        let Some(th_selector) = Selector::parse("th").ok() else {
+            log::warn!("failed to parse th selector in has_directory_table_headers");
+            return false;
+        };
+        let Some(td_selector) = Selector::parse("td").ok() else {
+            log::warn!("failed to parse td selector in has_directory_table_headers");
+            return false;
+        };
+
+        let mut headers = Vec::new();
+
+        // try <th> elements first
+        for th in html.select(&th_selector) {
+            let text = th.text().collect::<String>().to_lowercase();
+            headers.push(text.trim().to_string());
+        }
+
+        // fallback: if no <th> elements, try first row of <td> elements
+        if headers.is_empty() {
+            if let Ok(tr_selector) = Selector::parse("tr") {
+                if let Some(first_row) = html.select(&tr_selector).next() {
+                    for td in first_row.select(&td_selector) {
+                        let text = td.text().collect::<String>().to_lowercase();
+                        headers.push(text.trim().to_string());
+                    }
+                }
+            }
+        }
+
+        let mut has_name = false;
+        let mut has_size = false;
+        let mut has_time = false;
+
+        for header in headers {
+            if header == "name" || header.contains("file name") || header.contains("filename") {
+                has_name = true;
+            }
+            if header.contains("size") || header.contains("file size") {
+                has_size = true;
+            }
+            if header.contains("date")
+                || header.contains("last modified")
+                || header.contains("modified")
+                || header.contains("last mod")
+            {
+                has_time = true;
+            }
+        }
+
+        let category_count = [has_name, has_size, has_time]
+            .iter()
+            .filter(|&&x| x)
+            .count();
+        let result = category_count >= 2;
+
+        log::trace!("exit: has_directory_table_headers -> {result}");
+        result
+    }
+
+    /// check if the HTML contains sorting query parameters typical of auto-index pages
+    ///
+    /// returns true if any anchor href contains sorting parameters like:
+    /// - ?C=N (name), ?C=S (size), ?C=M (modified), ?C=D (date)
+    /// - optionally combined with &O=A or &O=D (ascending/descending)
+    fn has_sorting_query_params(&self, html: &Html) -> bool {
+        log::trace!("enter: has_sorting_query_params");
+
+        let Some(anchor_selector) = Selector::parse("a").ok() else {
+            log::warn!("failed to parse anchor selector in has_sorting_query_params");
+            return false;
+        };
+
+        for anchor in html.select(&anchor_selector) {
+            if let Some(href) = anchor.value().attr("href") {
+                let href_lower = href.to_lowercase();
+                if href_lower.contains("?c=n")
+                    || href_lower.contains("?c=s")
+                    || href_lower.contains("?c=m")
+                    || href_lower.contains("?c=d")
+                {
+                    log::trace!("exit: has_sorting_query_params -> true");
+                    return true;
+                }
+            }
+        }
+
+        log::trace!("exit: has_sorting_query_params -> false");
+        false
+    }
+
+    /// check if the HTML has a high density of file/directory links
+    ///
+    /// returns true if there are at least 3 links that look like files or directories:
+    /// - href ends with '/' (likely subdirectory)
+    /// - href looks like a file (common extensions)
+    fn has_high_link_density(&self, html: &Html) -> bool {
+        log::trace!("enter: has_high_link_density");
+
+        const MIN_LINKS: usize = 3;
+
+        let Some(anchor_selector) = Selector::parse("a").ok() else {
+            log::warn!("failed to parse anchor selector in has_high_link_density");
+            return false;
+        };
+        let mut count = 0;
+
+        for anchor in html.select(&anchor_selector) {
+            if let Some(href) = anchor.value().attr("href") {
+                let href_trimmed = href.trim();
+
+                // skip parent directory links and fragments
+                if href_trimmed == "../" || href_trimmed == ".." || href_trimmed.starts_with('#') {
+                    continue;
+                }
+
+                // check if it's a directory (ends with /)
+                if href_trimmed.ends_with('/') {
+                    count += 1;
+                    continue;
+                }
+
+                // check if it looks like a file - extract extension and O(1) lookup
+                let href_lower = href_trimmed.to_lowercase();
+                if let Some(dot_pos) = href_lower.rfind('.') {
+                    let extension = &href_lower[dot_pos..];
+                    if FILE_EXTENSION_SET.contains(extension) {
+                        count += 1;
+                    }
+                }
+            }
+        }
+
+        let result = count >= MIN_LINKS;
+        log::trace!("exit: has_high_link_density -> {result} (count: {count})");
+        result
     }
 
     /// given a target's base url, attempt to automatically detect its 404 response
@@ -258,7 +495,7 @@ impl HeuristicTests {
         &self,
         target_url: &str,
     ) -> Result<Option<WildcardResult>> {
-        log::trace!("enter: detect_404_like_responses({:?})", target_url);
+        log::trace!("enter: detect_404_like_responses({target_url:?})");
 
         if self.handles.config.dont_filter {
             // early return, dont_filter scans don't need tested
@@ -287,7 +524,7 @@ impl HeuristicTests {
         // and then we want to add any extensions that was specified
         // or has since been added to the running config
         for ext in &self.handles.config.extensions {
-            extensions.push(format!(".{}", ext));
+            extensions.push(format!(".{ext}"));
         }
 
         // for every method, attempt to id its 404 response
@@ -332,10 +569,10 @@ impl HeuristicTests {
                     // - http://localhost/adminf1d2541e73c44dcb9d1fb7d93334b280
                     // - http://localhost/admin92969beae6bf4beb855d1622406d87e395c87387a9ad432e8a11245002b709b03cf609d471004154b83bcc1c6ec49f6f
                     let Ok(response) =
-                        logged_request(&nonexistent_url, method, data, self.handles.clone())
-                            .await else {
-                                return None;
-                            };
+                        logged_request(&nonexistent_url, method, data, self.handles.clone()).await
+                    else {
+                        return None;
+                    };
 
                     if !self
                         .handles
@@ -356,6 +593,7 @@ impl HeuristicTests {
                             &ferox_url.target,
                             method,
                             self.handles.config.output_level,
+                            self.handles.config.response_size_limit,
                         )
                         .await,
                     )
@@ -372,7 +610,9 @@ impl HeuristicTests {
                 }
 
                 // check the responses for similarities on which we can filter, multiple may be returned
-                let Some((wildcard_filters, wildcard_responses)) = self.examine_404_like_responses(&responses) else {
+                let Some((wildcard_filters, wildcard_responses)) =
+                    self.examine_404_like_responses(&responses)
+                else {
                     // no match was found during analysis of responses
                     log::warn!("no match found for 404 responses");
                     continue;
@@ -407,7 +647,7 @@ impl HeuristicTests {
 
                             // if we're here, we've found a new wildcard that we didn't previously display, print it
                             if print_sentry {
-                                ferox_print(&format!("{}", new_wildcard), &PROGRESS_PRINTER);
+                                ferox_print(&format!("{new_wildcard}"), &PROGRESS_PRINTER);
                             }
                         }
                     }
@@ -422,12 +662,7 @@ impl HeuristicTests {
                 //
                 // in addition, we'll create a similarity filter as a fallback
                 for resp in wildcard_responses {
-                    let hash = SIM_HASHER.create_signature(preprocess(resp.text()).iter());
-
-                    let sim_filter = SimilarityFilter {
-                        hash,
-                        original_url: resp.url().to_string(),
-                    };
+                    let sim_filter = SimilarityFilter::from(resp);
 
                     self.handles
                         .filters
@@ -657,6 +892,212 @@ mod tests {
     /// `detect_directory_listing` returns None when heuristic doesn't match
     fn detect_directory_listing_returns_none_as_default() {
         let html = "<title>derp listing -- /</title>";
+        let parsed = Html::parse_document(html);
+        let handles = Handles::for_testing(None, None);
+        let heuristics = HeuristicTests::new(Arc::new(handles.0));
+        let dirlist_type = heuristics.detect_directory_listing(&parsed);
+        assert!(dirlist_type.is_none());
+    }
+
+    #[test]
+    /// `has_parent_directory_link` detects parent directory links by href
+    fn has_parent_directory_link_detects_by_href() {
+        let html = r#"<a href="../">Go up</a>"#;
+        let parsed = Html::parse_document(html);
+        let handles = Handles::for_testing(None, None);
+        let heuristics = HeuristicTests::new(Arc::new(handles.0));
+        assert!(heuristics.has_parent_directory_link(&parsed));
+
+        let html2 = r#"<a href="..">Go up</a>"#;
+        let parsed2 = Html::parse_document(html2);
+        assert!(heuristics.has_parent_directory_link(&parsed2));
+    }
+
+    #[test]
+    /// `has_parent_directory_link` detects parent directory links by text
+    fn has_parent_directory_link_detects_by_text() {
+        let html = r#"<a href="/parent">Parent Directory</a>"#;
+        let parsed = Html::parse_document(html);
+        let handles = Handles::for_testing(None, None);
+        let heuristics = HeuristicTests::new(Arc::new(handles.0));
+        assert!(heuristics.has_parent_directory_link(&parsed));
+
+        let html2 = r#"<a href="/up">To Parent</a>"#;
+        let parsed2 = Html::parse_document(html2);
+        assert!(heuristics.has_parent_directory_link(&parsed2));
+    }
+
+    #[test]
+    /// `has_parent_directory_link` returns false when no parent link
+    fn has_parent_directory_link_returns_false_when_absent() {
+        let html = r#"<a href="/about">About</a>"#;
+        let parsed = Html::parse_document(html);
+        let handles = Handles::for_testing(None, None);
+        let heuristics = HeuristicTests::new(Arc::new(handles.0));
+        assert!(!heuristics.has_parent_directory_link(&parsed));
+    }
+
+    #[test]
+    /// `has_directory_table_headers` detects table headers with name and size
+    fn has_directory_table_headers_detects_name_and_size() {
+        let html = r#"<table><thead><tr><th>File Name</th><th>Size</th></tr></thead></table>"#;
+        let parsed = Html::parse_document(html);
+        let handles = Handles::for_testing(None, None);
+        let heuristics = HeuristicTests::new(Arc::new(handles.0));
+        assert!(heuristics.has_directory_table_headers(&parsed));
+    }
+
+    #[test]
+    /// `has_directory_table_headers` detects table headers with name and date
+    fn has_directory_table_headers_detects_name_and_date() {
+        let html = r#"<table><thead><tr><th>Name</th><th>Last Modified</th></tr></thead></table>"#;
+        let parsed = Html::parse_document(html);
+        let handles = Handles::for_testing(None, None);
+        let heuristics = HeuristicTests::new(Arc::new(handles.0));
+        assert!(heuristics.has_directory_table_headers(&parsed));
+    }
+
+    #[test]
+    /// `has_directory_table_headers` returns false with only one category
+    fn has_directory_table_headers_requires_two_categories() {
+        let html = r#"<table><thead><tr><th>Name</th><th>Description</th></tr></thead></table>"#;
+        let parsed = Html::parse_document(html);
+        let handles = Handles::for_testing(None, None);
+        let heuristics = HeuristicTests::new(Arc::new(handles.0));
+        assert!(!heuristics.has_directory_table_headers(&parsed));
+    }
+
+    #[test]
+    /// `has_sorting_query_params` detects Apache-style sorting parameters
+    fn has_sorting_query_params_detects_apache_style() {
+        let html = r#"<a href="?C=N&O=A">Name</a><a href="?C=S&O=D">Size</a>"#;
+        let parsed = Html::parse_document(html);
+        let handles = Handles::for_testing(None, None);
+        let heuristics = HeuristicTests::new(Arc::new(handles.0));
+        assert!(heuristics.has_sorting_query_params(&parsed));
+    }
+
+    #[test]
+    /// `has_sorting_query_params` returns false when no sorting params
+    fn has_sorting_query_params_returns_false_when_absent() {
+        let html = r#"<a href="/page?q=search">Search</a>"#;
+        let parsed = Html::parse_document(html);
+        let handles = Handles::for_testing(None, None);
+        let heuristics = HeuristicTests::new(Arc::new(handles.0));
+        assert!(!heuristics.has_sorting_query_params(&parsed));
+    }
+
+    #[test]
+    /// `has_high_link_density` detects high density of file/directory links
+    fn has_high_link_density_detects_files_and_dirs() {
+        let html = r#"
+            <a href="backup/">backup/</a>
+            <a href="file1.html">file1.html</a>
+            <a href="file2.txt">file2.txt</a>
+        "#;
+        let parsed = Html::parse_document(html);
+        let handles = Handles::for_testing(None, None);
+        let heuristics = HeuristicTests::new(Arc::new(handles.0));
+        assert!(heuristics.has_high_link_density(&parsed));
+    }
+
+    #[test]
+    /// `has_high_link_density` requires at least 3 links
+    fn has_high_link_density_requires_minimum_links() {
+        let html = r#"
+            <a href="backup/">backup/</a>
+            <a href="file.html">file.html</a>
+        "#;
+        let parsed = Html::parse_document(html);
+        let handles = Handles::for_testing(None, None);
+        let heuristics = HeuristicTests::new(Arc::new(handles.0));
+        assert!(!heuristics.has_high_link_density(&parsed));
+    }
+
+    #[test]
+    /// `has_high_link_density` ignores parent directory links
+    fn has_high_link_density_ignores_parent_links() {
+        let html = r#"
+            <a href="../">Parent</a>
+            <a href="backup/">backup/</a>
+            <a href="file.html">file.html</a>
+        "#;
+        let parsed = Html::parse_document(html);
+        let handles = Handles::for_testing(None, None);
+        let heuristics = HeuristicTests::new(Arc::new(handles.0));
+        assert!(!heuristics.has_high_link_density(&parsed));
+    }
+
+    #[test]
+    /// `detect_directory_listing` detects custom listing with 2+ signals
+    fn detect_directory_listing_detects_custom_with_multiple_signals() {
+        // This HTML has parent link, table headers, sorting params, and link density
+        let html = r#"
+            <table><thead><tr>
+                <th><a href="?C=N&O=A">File Name</a></th>
+                <th><a href="?C=S&O=A">Size</a></th>
+            </tr></thead>
+            <tbody>
+                <tr><td><a href="../">Parent directory/</a></td></tr>
+                <tr><td><a href="backup/">backup/</a></td></tr>
+                <tr><td><a href="pass.html">pass.html</a></td></tr>
+            </tbody></table>
+        "#;
+        let parsed = Html::parse_document(html);
+        let handles = Handles::for_testing(None, None);
+        let heuristics = HeuristicTests::new(Arc::new(handles.0));
+        let dirlist_type = heuristics.detect_directory_listing(&parsed);
+        assert!(matches!(dirlist_type, Some(DirListingType::Custom)));
+    }
+
+    #[test]
+    /// `detect_directory_listing` requires at least 2 signals for custom detection
+    fn detect_directory_listing_requires_two_signals() {
+        // This HTML has only parent link (1 signal)
+        let html = r#"<a href="../">Parent directory/</a>"#;
+        let parsed = Html::parse_document(html);
+        let handles = Handles::for_testing(None, None);
+        let heuristics = HeuristicTests::new(Arc::new(handles.0));
+        let dirlist_type = heuristics.detect_directory_listing(&parsed);
+        assert!(dirlist_type.is_none());
+    }
+
+    #[test]
+    /// `detect_directory_listing` detects Root-Me sample page as custom
+    fn detect_directory_listing_detects_rootme_sample() {
+        // Simplified version of response.html from Root-Me
+        let html = r#"
+            <table id="list">
+                <thead><tr>
+                    <th><a href="?C=N&O=A">File Name</a></th>
+                    <th><a href="?C=S&O=A">File Size</a></th>
+                    <th><a href="?C=M&O=A">Date</a></th>
+                </tr></thead>
+                <tbody>
+                    <tr><td><a href="../">Parent directory/</a></td><td>-</td><td>-</td></tr>
+                    <tr><td><a href="backup/">backup/</a></td><td>-</td><td>2021-Dec-10</td></tr>
+                    <tr><td><a href="pass.html">pass.html</a></td><td>346 B</td><td>2021-Dec-10</td></tr>
+                </tbody>
+            </table>
+        "#;
+        let parsed = Html::parse_document(html);
+        let handles = Handles::for_testing(None, None);
+        let heuristics = HeuristicTests::new(Arc::new(handles.0));
+        let dirlist_type = heuristics.detect_directory_listing(&parsed);
+        assert!(matches!(dirlist_type, Some(DirListingType::Custom)));
+    }
+
+    #[test]
+    /// `detect_directory_listing` does not trigger on pages with many random links
+    fn detect_directory_listing_ignores_generic_pages() {
+        let html = r#"
+            <nav>
+                <a href="/about">About</a>
+                <a href="/contact">Contact</a>
+                <a href="/services">Services</a>
+                <a href="/products">Products</a>
+            </nav>
+        "#;
         let parsed = Html::parse_document(html);
         let handles = Handles::for_testing(None, None);
         let heuristics = HeuristicTests::new(Arc::new(handles.0));

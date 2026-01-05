@@ -1,4 +1,3 @@
-use std::io::stdin;
 use std::{
     env::{
         args,
@@ -8,7 +7,7 @@ use std::{
     io::{stderr, BufRead, BufReader},
     ops::Index,
     path::Path,
-    process::{exit, Command},
+    process::{exit, Command, Stdio},
     sync::{atomic::Ordering, Arc},
 };
 
@@ -25,7 +24,8 @@ use feroxbuster::{
     config::{Configuration, OutputLevel},
     event_handlers::{
         Command::{
-            AddHandles, CreateBar, Exit, JoinTasks, LoadStats, ScanInitialUrls, UpdateWordlist,
+            AddHandles, CreateBar, Exit, JoinTasks, LoadStats, ScanInitialUrls, UpdateTargets,
+            UpdateWordlist,
         },
         FiltersHandler, Handles, ScanHandler, StatsHandler, Tasks, TermInputHandler,
         TermOutHandler, SCAN_COMPLETE,
@@ -50,7 +50,7 @@ lazy_static! {
 
 /// Create a Vec of Strings from the given wordlist then stores it inside an Arc
 fn get_unique_words_from_wordlist(path: &str) -> Result<Arc<Vec<String>>> {
-    log::trace!("enter: get_unique_words_from_wordlist({})", path);
+    log::trace!("enter: get_unique_words_from_wordlist({path})");
     let mut trimmed_word = false;
 
     let file = File::open(path).with_context(|| format!("Could not open {path}"))?;
@@ -91,7 +91,7 @@ fn get_unique_words_from_wordlist(path: &str) -> Result<Arc<Vec<String>>> {
 
 /// Determine whether it's a single url scan or urls are coming from stdin, then scan as needed
 async fn scan(targets: Vec<String>, handles: Arc<Handles>) -> Result<()> {
-    log::trace!("enter: scan({:?}, {:?})", targets, handles);
+    log::trace!("enter: scan({targets:?}, {handles:?})");
 
     let scanned_urls = handles.ferox_scans()?;
 
@@ -131,7 +131,7 @@ async fn scan(targets: Vec<String>, handles: Arc<Handles>) -> Result<()> {
         scanned_urls.print_completed_bars(handles.wordlist.len())?;
     }
 
-    log::debug!("sending {:?} to be scanned as initial targets", targets);
+    log::debug!("sending {targets:?} to be scanned as initial targets");
     handles.send_scan_command(ScanInitialUrls(targets))?;
 
     log::trace!("exit: scan");
@@ -141,11 +141,11 @@ async fn scan(targets: Vec<String>, handles: Arc<Handles>) -> Result<()> {
 
 /// Get targets from either commandline or stdin, pass them back to the caller as a Result<Vec>
 async fn get_targets(handles: Arc<Handles>) -> Result<Vec<String>> {
-    log::trace!("enter: get_targets({:?})", handles);
+    log::trace!("enter: get_targets({handles:?})");
 
     let mut targets = vec![];
 
-    if handles.config.stdin {
+    if handles.config.stdin && handles.config.cached_stdin.is_empty() {
         // got targets from stdin, i.e. cat sites | ./feroxbuster ...
         // just need to read the targets from stdin and spawn a future for each target found
         let stdin = io::stdin(); // tokio's stdin, not std
@@ -154,6 +154,10 @@ async fn get_targets(handles: Arc<Handles>) -> Result<Vec<String>> {
         while let Some(line) = reader.next().await {
             targets.push(line?);
         }
+    } else if !handles.config.cached_stdin.is_empty() {
+        // cached_stdin populated from config::container if --stdin was used
+        // keeping the if block above as a failsafe, but i dont think we'll hit it anymore
+        targets = handles.config.cached_stdin.clone();
     } else if handles.config.resumed {
         // resume-from can't be used with --url, and --stdin is marked false for every resumed
         // scan, making it mutually exclusive from either of the other two options
@@ -196,13 +200,16 @@ async fn get_targets(handles: Arc<Handles>) -> Result<Vec<String>> {
             }
         }
 
-        if !target.starts_with("http") && !target.starts_with("https") {
+        if !target.starts_with("http") {
             // --url hackerone.com
-            *target = format!("https://{target}");
+            // as of the 2.13.0 update, config::container handles both --url hackerone.com
+            // and urls coming in from --stdin. I think this is dead code now, but leaving
+            // it in just in case
+            *target = format!("{}://{target}", handles.config.protocol);
         }
     }
 
-    log::trace!("exit: get_targets -> {:?}", targets);
+    log::trace!("exit: get_targets -> {targets:?}");
 
     Ok(targets)
 }
@@ -225,12 +232,12 @@ async fn wrapped_main(config: Arc<Configuration>) -> Result<()> {
     // check if update_app is true
     if config.update_app {
         match update_app().await {
-            Err(e) => eprintln!("\n[ERROR] {}", e),
+            Err(e) => eprintln!("\n[ERROR] {e}"),
             Ok(self_update::Status::UpToDate(version)) => {
-                eprintln!("\nFeroxbuster {} is up to date", version)
+                eprintln!("\nFeroxbuster {version} is up to date")
             }
             Ok(self_update::Status::Updated(version)) => {
-                eprintln!("\nFeroxbuster updated to {} version", version)
+                eprintln!("\nFeroxbuster updated to {version} version")
             }
         }
         exit(0);
@@ -238,7 +245,15 @@ async fn wrapped_main(config: Arc<Configuration>) -> Result<()> {
 
     let words = if config.wordlist.starts_with("http") {
         // found a url scheme, attempt to download the wordlist
-        let response = config.client.get(&config.wordlist).send().await?;
+        let response = config
+            .client
+            .get(&config.wordlist)
+            .send()
+            .await
+            .context(format!(
+                "Unable to download wordlist from remote url: {}",
+                config.wordlist
+            ))?;
 
         if !response.status().is_success() {
             // status code isn't a 200, bail
@@ -250,14 +265,15 @@ async fn wrapped_main(config: Arc<Configuration>) -> Result<()> {
         }
 
         // attempt to get the filename from the url's path
-        let Some(path_segments) = response
-            .url()
-            .path_segments() else {
-                bail!("Unable to parse path from url: {}", response.url());
-            };
+        let Some(mut path_segments) = response.url().path_segments() else {
+            bail!("Unable to parse path from url: {}", response.url());
+        };
 
-        let Some(filename) = path_segments.last() else {
-            bail!("Unable to parse filename from url's path: {}", response.url().path());
+        let Some(filename) = path_segments.next_back() else {
+            bail!(
+                "Unable to parse filename from url's path: {}",
+                response.url().path()
+            );
         };
 
         let filename = filename.to_string();
@@ -316,9 +332,15 @@ async fn wrapped_main(config: Arc<Configuration>) -> Result<()> {
     // create new Tasks object, each of these handles is one that will be joined on later
     let tasks = Tasks::new(out_task, stats_task, filters_task, scan_task);
 
-    if !config.time_limit.is_empty() {
+    if !config.time_limit.is_empty() && config.parallel == 0 {
         // --time-limit value not an empty string, need to kick off the thread that enforces
         // the limit
+        //
+        // if --parallel is used, this branch won't execute in the main process, but will in the
+        // children. This is because --parallel is stripped from the children's command line
+        // arguments, so, when spawned, they won't have --parallel, the parallel value will be set
+        // to the default of 0, and will hit this branch. This makes it so that the time limit
+        // is enforced on each individual child process, instead of the main process
         let time_handles = handles.clone();
         tokio::spawn(async move { scan_manager::start_max_time_thread(time_handles).await });
     }
@@ -361,16 +383,13 @@ async fn wrapped_main(config: Arc<Configuration>) -> Result<()> {
 
         let invocation = args();
 
-        let para_regex =
-            Regex::new("--stdin|-q|--quiet|--silent|--verbosity|-v|-vv|-vvv|-vvvv").unwrap();
+        let para_regex = Regex::new("--stdin").unwrap();
 
         // remove stdin since only the original process will process targets
         // remove quiet and silent so we can force silent later to normalize output
         let mut original = invocation
             .filter(|s| !para_regex.is_match(s))
             .collect::<Vec<String>>();
-
-        original.push("--silent".to_string()); // only output modifier allowed
 
         // we need remove --parallel from command line so we don't hit this branch over and over
         // but we must remove --parallel N manually; the filter above never sees --parallel and the
@@ -446,16 +465,33 @@ async fn wrapped_main(config: Arc<Configuration>) -> Result<()> {
 
             log::debug!("parallel exec: {} {}", bin, args.join(" "));
 
-            tokio::task::spawn_blocking(move || {
-                let result = Command::new(bin)
+            tokio::task::spawn(async move {
+                let mut output = Command::new(bin)
                     .args(&args)
+                    .stdout(Stdio::piped())
                     .spawn()
-                    .expect("failed to spawn a child process")
-                    .wait()
-                    .expect("child process errored during execution");
+                    .expect("failed to spawn a child process");
 
+                let stdout = output.stdout.take().unwrap();
+
+                let mut bufread = BufReader::new(stdout);
+                // output for a single line is a minimum of 51 bytes, so we'll start with that
+                // + a little wiggle room, and grow as needed
+                let mut buf: String = String::with_capacity(128);
+
+                while let Ok(n) = bufread.read_line(&mut buf) {
+                    if n > 0 {
+                        let trimmed = buf.trim();
+                        if !trimmed.is_empty() {
+                            println!("{trimmed}");
+                        }
+                        buf.clear();
+                    } else {
+                        break;
+                    }
+                }
+                let _ = output.wait();
                 drop(permit);
-                result
             });
         }
 
@@ -478,6 +514,14 @@ async fn wrapped_main(config: Arc<Configuration>) -> Result<()> {
         log::trace!("exit: parallel branch && wrapped main");
         return Ok(());
     }
+
+    // in order for the Stats object to know about which targets are being scanned, we need to
+    // wait until the parallel branch has been handled before sending the UpdateTargets command
+    // this ensures that only the targets being scanned are sent to the Stats object
+    //
+    // if sent before the parallel branch is handled, the Stats object will have duplicate
+    // targets
+    handles.stats.send(UpdateTargets(targets.clone()))?;
 
     if matches!(config.output_level, OutputLevel::Default) {
         // only print banner if output level is default (no banner on --quiet|--silent)
@@ -512,9 +556,9 @@ async fn wrapped_main(config: Arc<Configuration>) -> Result<()> {
     let live_targets = {
         let test = heuristics::HeuristicTests::new(handles.clone());
         let result = test.connectivity(&targets).await;
-        if result.is_err() {
+        if let Err(err) = result {
             clean_up(handles, tasks).await?;
-            bail!(fmt_err(&result.unwrap_err().to_string()));
+            bail!(fmt_err(&err.to_string()));
         }
         result?
     };
@@ -542,7 +586,7 @@ async fn wrapped_main(config: Arc<Configuration>) -> Result<()> {
 /// Single cleanup function that handles all the necessary drops/finishes etc required to gracefully
 /// shutdown the program
 async fn clean_up(handles: Arc<Handles>, tasks: Tasks) -> Result<()> {
-    log::trace!("enter: clean_up({:?}, {:?})", handles, tasks);
+    log::trace!("enter: clean_up({handles:?}, {tasks:?})");
 
     let (tx, rx) = oneshot::channel::<bool>();
     handles.send_scan_command(JoinTasks(tx))?;
@@ -575,7 +619,7 @@ async fn clean_up(handles: Arc<Handles>, tasks: Tasks) -> Result<()> {
 }
 
 async fn update_app() -> Result<self_update::Status, Box<dyn ::std::error::Error>> {
-    let target_os = format!("{}-{}", ARCH, OS);
+    let target_os = format!("{ARCH}-{OS}");
     let status = tokio::task::spawn_blocking(move || {
         self_update::backends::github::Update::configure()
             .repo_owner("epi052")
@@ -628,16 +672,16 @@ fn main() -> Result<()> {
                 .contains("/definitely/doesnt/exist/0cd7fed0-47f4-4b18-a1b0-ac39708c1676")
             {
                 // support the handful of tests that use `--stdin`
-                let targets: Vec<_> = if config.stdin {
-                    stdin().lock().lines().map(|tgt| tgt.unwrap()).collect()
-                } else {
+                let targets: Vec<_> = if config.cached_stdin.is_empty() {
                     vec!["http://localhost".to_string()]
+                } else {
+                    config.cached_stdin.clone()
                 };
 
                 // print the banner to stderr
                 let std_stderr = stderr(); // std::io::stderr
                 let banner = Banner::new(&targets, &config);
-                if !config.quiet && !config.silent {
+                if (!config.quiet && !config.silent) || config.parallel != 0 {
                     banner.print_to(std_stderr, config).unwrap();
                 }
             }

@@ -40,12 +40,12 @@ pub fn initialize() -> Command {
             Arg::new("url")
                 .short('u')
                 .long("url")
-                .required_unless_present_any(["stdin", "resume_from", "update_app"])
+                .required_unless_present_any(["stdin", "resume_from", "update_app", "request_file"])
                 .help_heading("Target selection")
                 .value_name("URL")
                 .use_value_delimiter(true)
                 .value_hint(ValueHint::Url)
-                .help("The target URL (required, unless [--stdin || --resume-from] used)"),
+                .help("The target URL (required, unless [--stdin || --resume-from || --request-file] used)"),
         )
         .arg(
             Arg::new("stdin")
@@ -64,6 +64,15 @@ pub fn initialize() -> Command {
                 .help("State file from which to resume a partially complete scan (ex. --resume-from ferox-1606586780.state)")
                 .conflicts_with("url")
                 .num_args(1),
+        ).arg(
+            Arg::new("request_file")
+                .long("request-file")
+                .help_heading("Target selection")
+                .value_hint(ValueHint::FilePath)
+                .conflicts_with("url")
+                .num_args(1)
+                .value_name("REQUEST_FILE")
+                .help("Raw HTTP request file to use as a template for all requests"),
         );
 
     /////////////////////////////////////////////////////////////////////
@@ -87,6 +96,24 @@ pub fn initialize() -> Command {
                 .help("Set --replay-proxy to http://127.0.0.1:8080 and set --insecure to true"),
         )
         .arg(
+            Arg::new("data-urlencoded")
+                .long("data-urlencoded")
+                .value_name("DATA")
+                .num_args(1)
+                .help_heading("Composite settings")
+                .conflicts_with_all(["data", "data-json"])
+                .help("Set -H 'Content-Type: application/x-www-form-urlencoded', --data to <data-urlencoded> (supports @file) and -m to POST"),
+        )
+        .arg(
+            Arg::new("data-json")
+                .long("data-json")
+                .value_name("DATA")
+                .num_args(1)
+                .help_heading("Composite settings")
+                .conflicts_with_all(["data", "data-urlencoded"])
+                .help("Set -H 'Content-Type: application/json', --data to <data-json> (supports @file) and -m to POST"),
+        )
+        .arg(
             Arg::new("smart")
                 .long("smart")
                 .num_args(0)
@@ -100,7 +127,7 @@ pub fn initialize() -> Command {
                 .num_args(0)
                 .help_heading("Composite settings")
                 .conflicts_with_all(["rate_limit", "auto_bail"])
-                .help("Use the same settings as --smart and set --collect-extensions to true"),
+                .help("Use the same settings as --smart and set --collect-extensions and --scan-dir-listings to true"),
         );
 
     /////////////////////////////////////////////////////////////////////
@@ -177,7 +204,7 @@ pub fn initialize() -> Command {
                 .use_value_delimiter(true)
                 .help_heading("Request settings")
                 .help(
-                    "File extension(s) to search for (ex: -x php -x pdf js)",
+                    "File extension(s) to search for (ex: -x php -x pdf js); reads values (newline-separated) from file if input starts with an @ (ex: @ext.txt)",
                 ),
         )
         .arg(
@@ -211,7 +238,6 @@ pub fn initialize() -> Command {
                 .num_args(1..)
                 .action(ArgAction::Append)
                 .help_heading("Request settings")
-                .use_value_delimiter(true)
                 .help(
                     "Specify HTTP headers to be used in each request (ex: -H Header:val -H 'stuff: things')",
                 ),
@@ -249,6 +275,13 @@ pub fn initialize() -> Command {
                 .help_heading("Request settings")
                 .num_args(0)
                 .help("Append / to each request's URL")
+        ).arg(
+            Arg::new("protocol")
+                .long("protocol")
+                .value_name("PROTOCOL")
+                .num_args(1)
+                .help_heading("Request settings")
+                .help("Specify the protocol to use when targeting via --request-file or --url with domain only (default: https)"),
         );
 
     /////////////////////////////////////////////////////////////////////
@@ -263,6 +296,15 @@ pub fn initialize() -> Command {
             .use_value_delimiter(true)
             .help_heading("Request filters")
             .help("URL(s) or Regex Pattern(s) to exclude from recursion/scans"),
+    ).arg(
+        Arg::new("scope")
+            .long("scope")
+            .value_name("URL")
+            .num_args(1..)
+            .action(ArgAction::Append)
+            .use_value_delimiter(true)
+            .help_heading("Request filters")
+            .help("Additional domains/URLs to consider in-scope for scanning (in addition to current domain)"),
     );
 
     /////////////////////////////////////////////////////////////////////
@@ -292,7 +334,7 @@ pub fn initialize() -> Command {
                 .use_value_delimiter(true)
                 .help_heading("Response filters")
                 .help(
-                    "Filter out messages via regular expression matching on the response's body (ex: -X '^ignore me$')",
+                    "Filter out messages via regular expression matching on the response's body/headers (ex: -X '^ignore me$')",
                 ),
         )
         .arg(
@@ -360,6 +402,13 @@ pub fn initialize() -> Command {
                 .help(
                     "Status Codes to include (allow list) (default: All Status Codes)",
                 ),
+        )
+        .arg(
+            Arg::new("unique")
+                .long("unique")
+                .num_args(0)
+                .help_heading("Response filters")
+                .help("Only show unique responses")
         );
 
     /////////////////////////////////////////////////////////////////////
@@ -486,6 +535,8 @@ pub fn initialize() -> Command {
             Arg::new("parallel")
                 .long("parallel")
                 .value_name("PARALLEL_SCANS")
+                .conflicts_with("verbosity")
+                .conflicts_with("url")
                 .num_args(1)
                 .requires("stdin")
                 .help_heading("Scan settings")
@@ -496,9 +547,16 @@ pub fn initialize() -> Command {
                 .long("rate-limit")
                 .value_name("RATE_LIMIT")
                 .num_args(1)
-                .conflicts_with("auto_tune")
                 .help_heading("Scan settings")
                 .help("Limit number of requests per second (per directory) (default: 0, i.e. no limit)")
+        )
+        .arg(
+            Arg::new("response_size_limit")
+                .long("response-size-limit")
+                .value_name("BYTES")
+                .num_args(1)
+                .help_heading("Scan settings")
+                .help("Limit size of response body to read in bytes (default: 4MB)"),
         )
         .arg(
             Arg::new("time_limit")
@@ -550,9 +608,9 @@ pub fn initialize() -> Command {
             Arg::new("collect_backups")
                 .short('B')
                 .long("collect-backups")
-                .num_args(0)
+                .num_args(0..)
                 .help_heading("Dynamic collection settings")
-                .help("Automatically request likely backup extensions for \"found\" urls")
+                .help("Automatically request likely backup extensions for \"found\" urls (default: ~, .bak, .bak2, .old, .1)")
         )
         .arg(
             Arg::new("collect_words")
@@ -573,6 +631,12 @@ pub fn initialize() -> Command {
                 .help(
                     "File extension(s) to Ignore while collecting extensions (only used with --collect-extensions)",
                 ),
+        ).arg(
+            Arg::new("scan_dir_listings")
+                .long("scan-dir-listings")
+                .num_args(0)
+                .help_heading("Scan settings")
+                .help("Force scans to recurse into directory listings")
         );
 
     /////////////////////////////////////////////////////////////////////
@@ -594,7 +658,7 @@ pub fn initialize() -> Command {
                 .num_args(0)
                 .conflicts_with("quiet")
                 .help_heading("Output settings")
-                .help("Only print URLs + turn off logging (good for piping a list of urls to other commands)")
+                .help("Only print URLs (or JSON w/ --json) + turn off logging (good for piping a list of urls to other commands)")
         )
         .arg(
             Arg::new("quiet")
@@ -637,6 +701,13 @@ pub fn initialize() -> Command {
                 .num_args(0)
                 .help_heading("Output settings")
                 .help("Disable state output file (*.state)")
+        ).arg(
+            Arg::new("limit_bars")
+                .long("limit-bars")
+                .value_name("NUM_BARS_TO_SHOW")
+                .num_args(1)
+                .help_heading("Output settings")
+                .help("Number of directory scan bars to show at any given time (default: no limit)"),
         );
 
     /////////////////////////////////////////////////////////////////////
@@ -645,8 +716,13 @@ pub fn initialize() -> Command {
     let mut app = app
         .group(
             ArgGroup::new("output_files")
-                .args(["debug_log", "output"])
+                .args(["debug_log", "output", "silent"])
                 .multiple(true),
+        )
+        .group(
+            ArgGroup::new("output_limiters")
+                .args(["quiet", "silent"])
+                .multiple(false),
         )
         .arg(
             Arg::new("update_app")

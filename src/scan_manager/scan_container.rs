@@ -5,6 +5,7 @@ use crate::filters::{
     EmptyFilter, LinesFilter, RegexFilter, SimilarityFilter, SizeFilter, StatusCodeFilter,
     WildcardFilter, WordsFilter,
 };
+use crate::sync::DynamicSemaphore;
 use crate::traits::FeroxFilter;
 use crate::Command::AddFilter;
 use crate::{
@@ -12,6 +13,7 @@ use crate::{
     config::OutputLevel,
     progress::PROGRESS_PRINTER,
     progress::{add_bar, BarType},
+    scan_manager::utils::determine_bar_type,
     scan_manager::{MenuCmd, MenuCmdResult},
     scanner::RESPONSES,
     traits::FeroxSerialize,
@@ -33,6 +35,7 @@ use std::{
     },
     thread::sleep,
 };
+use tokio::sync::oneshot;
 use tokio::time::{self, Duration};
 
 /// Single atomic number that gets incremented once, used to track first thread to interact with
@@ -60,6 +63,9 @@ pub struct FeroxScans {
 
     /// vector of extensions discovered and collected during scans
     pub(crate) collected_extensions: RwLock<HashSet<String>>,
+
+    /// stored value for Configuration.limit_bars
+    bar_limit: usize,
 }
 
 /// Serialize implementation for FeroxScans
@@ -92,9 +98,10 @@ impl Serialize for FeroxScans {
 /// Implementation of `FeroxScans`
 impl FeroxScans {
     /// given an OutputLevel, create a new FeroxScans object
-    pub fn new(output_level: OutputLevel) -> Self {
+    pub fn new(output_level: OutputLevel, bar_limit: usize) -> Self {
         Self {
             output_level,
+            bar_limit,
             ..Default::default()
         }
     }
@@ -116,7 +123,7 @@ impl FeroxScans {
                     scans.push(scan);
                 }
                 Err(e) => {
-                    log::warn!("FeroxScans' container's mutex is poisoned: {}", e);
+                    log::warn!("FeroxScans' container's mutex is poisoned: {e}");
                     return false;
                 }
             }
@@ -127,7 +134,7 @@ impl FeroxScans {
 
     /// load serialized FeroxScan(s) and any previously collected extensions into this FeroxScans  
     pub fn add_serialized_scans(&self, filename: &str, handles: Arc<Handles>) -> Result<()> {
-        log::trace!("enter: add_serialized_scans({})", filename);
+        log::trace!("enter: add_serialized_scans({filename})");
         let file = File::open(filename)?;
 
         let reader = BufReader::new(file);
@@ -249,7 +256,7 @@ impl FeroxScans {
     }
 
     pub fn get_base_scan_by_url(&self, url: &str) -> Option<Arc<FeroxScan>> {
-        log::trace!("enter: get_base_scan_by_url({})", url);
+        log::trace!("enter: get_base_scan_by_url({url})");
 
         // rmatch_indices returns tuples in index, match form, i.e. (10, "/")
         // with the furthest-right match in the first position in the vector
@@ -273,7 +280,7 @@ impl FeroxScans {
                 for scan in guard.iter() {
                     let slice = url.index(0..*idx);
                     if slice == scan.url || format!("{slice}/").as_str() == scan.url {
-                        log::trace!("enter: get_base_scan_by_url -> {}", scan);
+                        log::trace!("enter: get_base_scan_by_url -> {scan}");
                         return Some(scan.clone());
                     }
                 }
@@ -330,6 +337,13 @@ impl FeroxScans {
                     self.menu
                         .println(&format!("{}:", style("Scans").bright().blue()));
                 }
+
+                if let Ok(guard) = scan.status.lock() {
+                    if matches!(*guard, ScanStatus::Cancelled) {
+                        continue;
+                    }
+                }
+
                 // we're only interested in displaying directory scans, as those are
                 // the only ones that make sense to be stopped
                 let scan_msg = format!("{i:3}: {scan}");
@@ -360,7 +374,14 @@ impl FeroxScans {
                         sleep(menu_pause_duration);
                         continue;
                     }
-                    u_scans.index(num).clone()
+
+                    let selected = u_scans.index(num);
+
+                    if matches!(selected.scan_type, ScanType::File) {
+                        continue;
+                    }
+
+                    selected.clone()
                 }
                 Err(..) => continue,
             };
@@ -373,10 +394,11 @@ impl FeroxScans {
 
             if input == 'y' || input == '\n' {
                 self.menu.println(&format!("Stopping {}...", selected.url));
+                let active_bars = self.number_of_bars();
                 selected
-                    .abort()
+                    .abort(active_bars)
                     .await
-                    .unwrap_or_else(|e| log::warn!("Could not cancel task: {}", e));
+                    .unwrap_or_else(|e| log::warn!("Could not cancel task: {e}"));
 
                 let pb = selected.progress_bar();
                 num_cancelled += pb.length().unwrap_or(0) as usize - pb.position() as usize;
@@ -412,10 +434,23 @@ impl FeroxScans {
     }
 
     /// CLI menu that allows for interactive cancellation of recursed-into directories
-    async fn interactive_menu(&self, handles: Arc<Handles>) -> Option<MenuCmdResult> {
+    async fn interactive_menu(
+        &self,
+        handles: Arc<Handles>,
+        limiter: Arc<DynamicSemaphore>,
+    ) -> Option<MenuCmdResult> {
         self.menu.hide_progress_bars();
         self.menu.clear_screen();
         self.menu.print_header();
+        let (tx, rx) = oneshot::channel::<Duration>();
+        if handles.stats.send(Command::QueryOverallBarEta(tx)).is_ok() {
+            if let Ok(y) = rx.await {
+                self.menu.print_eta(y);
+            }
+        }
+
+        self.menu.print_scan_limit(limiter.clone());
+
         self.display_scans().await;
         self.display_filters(handles.clone());
         self.menu.print_footer();
@@ -441,12 +476,33 @@ impl FeroxScans {
                     .unwrap_or_default();
                 None
             }
+            Some(MenuCmd::SetScanPermits(value)) => {
+                if limiter.current_capacity() == value {
+                    // value is equal to current capacity, so we don't need to do anything
+                    return None;
+                }
+
+                if limiter.current_capacity() < value {
+                    // value is greater than current capacity, so we need to increase it
+                    Some(MenuCmdResult::NumPermitsToAdd(
+                        value - limiter.current_capacity(),
+                    ))
+                } else {
+                    // value is less than current capacity, so we need to decrease it
+                    Some(MenuCmdResult::NumPermitsToSubtract(
+                        limiter.current_capacity() - value,
+                    ))
+                }
+            }
             None => None,
         };
 
         self.menu.clear_screen();
 
-        let banner = Banner::new(&[handles.config.target_url.clone()], &handles.config);
+        let banner = Banner::new(
+            std::slice::from_ref(&handles.config.target_url),
+            &handles.config,
+        );
         banner
             .print_to(&self.menu.term, handles.config.clone())
             .unwrap_or_default();
@@ -499,14 +555,22 @@ impl FeroxScans {
 
     /// if a resumed scan is already complete, display a completed progress bar to the user
     pub fn print_completed_bars(&self, bar_length: usize) -> Result<()> {
-        let bar_type = match self.output_level {
-            OutputLevel::Default => BarType::Message,
-            OutputLevel::Quiet => BarType::Quiet,
-            OutputLevel::Silent => return Ok(()), // fast exit when --silent was used
-        };
+        if self.output_level == OutputLevel::SilentJSON || self.output_level == OutputLevel::Silent
+        {
+            // fast exit when --silent was used
+            return Ok(());
+        }
+
+        let bar_type: BarType =
+            determine_bar_type(self.bar_limit, self.number_of_bars(), self.output_level);
 
         if let Ok(scans) = self.scans.read() {
             for scan in scans.iter() {
+                if matches!(bar_type, BarType::Hidden) {
+                    // no need to show hidden bars
+                    continue;
+                }
+
                 if scan.is_complete() {
                     // these scans are complete, and just need to be shown to the user
                     let pb = add_bar(
@@ -531,6 +595,7 @@ impl FeroxScans {
         &self,
         get_user_input: bool,
         handles: Arc<Handles>,
+        limiter: Arc<DynamicSemaphore>,
     ) -> Option<MenuCmdResult> {
         // function uses tokio::time, not std
 
@@ -543,7 +608,7 @@ impl FeroxScans {
             INTERACTIVE_BARRIER.fetch_add(1, Ordering::Relaxed);
 
             if get_user_input {
-                command_result = self.interactive_menu(handles).await;
+                command_result = self.interactive_menu(handles, limiter).await;
                 PAUSE_SCAN.store(false, Ordering::Relaxed);
                 self.print_known_responses();
             }
@@ -560,7 +625,7 @@ impl FeroxScans {
                     INTERACTIVE_BARRIER.fetch_sub(1, Ordering::Relaxed);
                 }
 
-                log::trace!("exit: pause_scan -> {:?}", command_result);
+                log::trace!("exit: pause_scan -> {command_result:?}");
                 return command_result;
             }
         }
@@ -583,6 +648,7 @@ impl FeroxScans {
         url: &str,
         scan_type: ScanType,
         scan_order: ScanOrder,
+        handles: Arc<Handles>,
     ) -> (bool, Arc<FeroxScan>) {
         let bar_length = if let Ok(guard) = self.bar_length.lock() {
             *guard
@@ -590,14 +656,11 @@ impl FeroxScans {
             0
         };
 
+        let active_bars = self.number_of_bars();
+        let bar_type = determine_bar_type(self.bar_limit, active_bars, self.output_level);
+
         let bar = match scan_type {
             ScanType::Directory => {
-                let bar_type = match self.output_level {
-                    OutputLevel::Default => BarType::Default,
-                    OutputLevel::Quiet => BarType::Quiet,
-                    OutputLevel::Silent => BarType::Hidden,
-                };
-
                 let progress_bar = add_bar(url, bar_length, bar_type);
 
                 progress_bar.reset_elapsed();
@@ -607,6 +670,8 @@ impl FeroxScans {
             ScanType::File => None,
         };
 
+        let is_visible = !matches!(bar_type, BarType::Hidden);
+
         let ferox_scan = FeroxScan::new(
             url,
             scan_type,
@@ -614,6 +679,8 @@ impl FeroxScans {
             bar_length,
             self.output_level,
             bar,
+            is_visible,
+            handles,
         );
 
         // If the set did not contain the scan, true is returned.
@@ -628,9 +695,14 @@ impl FeroxScans {
     /// If `FeroxScans` did not already contain the scan, return true; otherwise return false
     ///
     /// Also return a reference to the new `FeroxScan`
-    pub fn add_directory_scan(&self, url: &str, scan_order: ScanOrder) -> (bool, Arc<FeroxScan>) {
+    pub fn add_directory_scan(
+        &self,
+        url: &str,
+        scan_order: ScanOrder,
+        handles: Arc<Handles>,
+    ) -> (bool, Arc<FeroxScan>) {
         let normalized = format!("{}/", url.trim_end_matches('/'));
-        self.add_scan(&normalized, ScanType::Directory, scan_order)
+        self.add_scan(&normalized, ScanType::Directory, scan_order, handles)
     }
 
     /// Given a url, create a new `FeroxScan` and add it to `FeroxScans` as a File Scan
@@ -638,8 +710,65 @@ impl FeroxScans {
     /// If `FeroxScans` did not already contain the scan, return true; otherwise return false
     ///
     /// Also return a reference to the new `FeroxScan`
-    pub fn add_file_scan(&self, url: &str, scan_order: ScanOrder) -> (bool, Arc<FeroxScan>) {
-        self.add_scan(url, ScanType::File, scan_order)
+    pub fn add_file_scan(
+        &self,
+        url: &str,
+        scan_order: ScanOrder,
+        handles: Arc<Handles>,
+    ) -> (bool, Arc<FeroxScan>) {
+        self.add_scan(url, ScanType::File, scan_order, handles)
+    }
+
+    /// returns the number of active AND visible scans; supports --limit-bars functionality
+    pub fn number_of_bars(&self) -> usize {
+        let Ok(scans) = self.scans.read() else {
+            return 0;
+        };
+
+        // starting at one ensures we don't have an extra bar
+        // due to counting up from 0 when there's actually 1 bar
+        let mut count = 1;
+
+        for scan in &*scans {
+            if scan.is_active() && scan.visible() {
+                count += 1;
+            }
+        }
+
+        count
+    }
+
+    /// make one hidden bar visible; supports --limit-bars functionality
+    pub fn make_visible(&self) {
+        if let Ok(guard) = self.scans.read() {
+            // when swapping visibility, we'll prefer an actively running scan
+            // if none are found, we'll
+            let mut queued = None;
+
+            for scan in &*guard {
+                if !matches!(scan.scan_type, ScanType::Directory) {
+                    // visibility only makes sense for directory scans
+                    continue;
+                }
+
+                if scan.visible() {
+                    continue;
+                }
+
+                if scan.is_running() {
+                    scan.swap_visibility();
+                    return;
+                }
+
+                if queued.is_none() && scan.is_not_started() {
+                    queued = Some(scan.clone());
+                }
+            }
+
+            if let Some(scan) = queued {
+                scan.swap_visibility();
+            }
+        }
     }
 
     /// small helper to determine whether any scans are active or not
@@ -672,7 +801,7 @@ impl FeroxScans {
     /// given an extension, add it to `collected_extensions` if all constraints are met
     /// returns `true` if an extension was added, `false` otherwise
     pub fn add_discovered_extension(&self, extension: String) -> bool {
-        log::trace!("enter: add_discovered_extension({})", extension);
+        log::trace!("enter: add_discovered_extension({extension})");
         let mut extension_added = false;
 
         // note: the filter by --dont-collect happens in the event handler, since it has access
@@ -687,12 +816,12 @@ impl FeroxScans {
         }
 
         if let Ok(mut extensions) = self.collected_extensions.write() {
-            log::info!("discovered new extension: {}", extension);
+            log::info!("discovered new extension: {extension}");
             extensions.insert(extension);
             extension_added = true;
         }
 
-        log::trace!("exit: add_discovered_extension -> {}", extension_added);
+        log::trace!("exit: add_discovered_extension -> {extension_added}");
         extension_added
     }
 }
@@ -704,7 +833,7 @@ mod tests {
     #[test]
     /// unknown extension should be added to collected_extensions
     fn unknown_extension_is_added_to_collected_extensions() {
-        let scans = FeroxScans::new(OutputLevel::Default);
+        let scans = FeroxScans::new(OutputLevel::Default, 0);
 
         assert_eq!(0, scans.collected_extensions.read().unwrap().len());
 
@@ -717,7 +846,7 @@ mod tests {
     #[test]
     /// known extension should not be added to collected_extensions
     fn known_extension_is_added_to_collected_extensions() {
-        let scans = FeroxScans::new(OutputLevel::Default);
+        let scans = FeroxScans::new(OutputLevel::Default, 0);
         scans
             .collected_extensions
             .write()

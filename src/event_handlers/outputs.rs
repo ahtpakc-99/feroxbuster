@@ -7,6 +7,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::{
     config::Configuration,
+    filters::SimilarityFilter,
     progress::PROGRESS_PRINTER,
     response::FeroxResponse,
     scanner::RESPONSES,
@@ -14,8 +15,9 @@ use crate::{
     statistics::StatField::{ResourcesDiscovered, TotalExpected},
     traits::FeroxSerialize,
     utils::{ferox_print, fmt_err, make_request, open_file, write_to},
-    CommandReceiver, CommandSender, Joiner,
+    CommandReceiver, CommandSender, Joiner, UNIQUE_DISTANCE,
 };
+
 use std::sync::Arc;
 use url::Url;
 
@@ -92,11 +94,13 @@ impl FileOutHandler {
     ///
     /// The consumer simply receives responses from the terminal handler and writes them to disk
     async fn start(&mut self, tx_stats: CommandSender) -> Result<()> {
-        log::trace!("enter: start_file_handler({:?})", tx_stats);
+        log::trace!("enter: start_file_handler({tx_stats:?})");
 
         let mut file = open_file(&self.config.output)?;
 
         log::info!("Writing scan results to {}", self.config.output);
+
+        write_to(&*self.config, &mut file, self.config.json)?;
 
         while let Some(command) = self.receiver.recv().await {
             match command {
@@ -172,7 +176,7 @@ impl TermOutHandler {
         config: Arc<Configuration>,
         tx_stats: CommandSender,
     ) -> (Joiner, TermOutHandle) {
-        log::trace!("enter: initialize({:?}, {:?})", config, tx_stats);
+        log::trace!("enter: initialize({config:?}, {tx_stats:?})");
 
         let (tx_term, rx_term) = mpsc::unbounded_channel::<Command>();
         let (tx_file, rx_file) = mpsc::unbounded_channel::<Command>();
@@ -195,7 +199,7 @@ impl TermOutHandler {
 
         let event_handle = TermOutHandle::new(tx_term, tx_file);
 
-        log::trace!("exit: initialize -> ({:?}, {:?})", term_task, event_handle);
+        log::trace!("exit: initialize -> ({term_task:?}, {event_handle:?})");
 
         (term_task, event_handle)
     }
@@ -204,13 +208,17 @@ impl TermOutHandler {
     ///
     /// The consumer simply receives `Command` and acts accordingly
     async fn start(&mut self, tx_stats: CommandSender) -> Result<()> {
-        log::trace!("enter: start({:?})", tx_stats);
+        log::trace!("enter: start({tx_stats:?})");
 
         while let Some(command) = self.receiver.recv().await {
             match command {
                 Command::Report(resp) => {
-                    self.process_response(tx_stats.clone(), resp, ProcessResponseCall::Recursive)
-                        .await?;
+                    if let Err(err) = self
+                        .process_response(tx_stats.clone(), resp, ProcessResponseCall::Recursive)
+                        .await
+                    {
+                        log::warn!("{err}");
+                    }
                 }
                 Command::Sync(sender) => {
                     sender.send(true).unwrap_or_default();
@@ -239,7 +247,7 @@ impl TermOutHandler {
         mut resp: Box<FeroxResponse>,
         call_type: ProcessResponseCall,
     ) -> BoxFuture<'_, Result<()>> {
-        log::trace!("enter: process_response({:?}, {:?})", resp, call_type);
+        log::trace!("enter: process_response({resp:?}, {call_type:?})");
 
         async move {
             let contains_sentry = if !self.config.filter_status.is_empty() {
@@ -325,8 +333,30 @@ impl TermOutHandler {
                         resp.url().as_str(),
                         resp.method().as_str(),
                         resp.output_level,
+                        self.config.response_size_limit,
                     )
                     .await;
+
+                    let Some(handles) = self.handles.as_ref() else {
+                        // shouldn't ever happen, but we'll log and return early if it does
+                        log::error!("handles were unexpectedly None, this shouldn't happen");
+                        return Ok(());
+                    };
+
+                    if handles
+                        .filters
+                        .data
+                        .should_filter_response(&ferox_response, tx_stats.clone())
+                    {
+                        // response was filtered for one reason or another, don't process it
+                        continue;
+                    }
+
+                    if handles.config.unique {
+                        let mut unique_filter = SimilarityFilter::from(&ferox_response);
+                        unique_filter.cutoff = UNIQUE_DISTANCE;
+                        handles.filters.data.push(Box::new(unique_filter))?;
+                    }
 
                     self.process_response(
                         tx_stats.clone(),
@@ -375,17 +405,17 @@ impl TermOutHandler {
     ///         - LICENSE.bak
     ///         - .LICENSE.txt.swp
     async fn generate_backup_urls(&self, response: &FeroxResponse) -> Vec<Url> {
-        log::trace!("enter: generate_backup_urls({:?})", response);
+        log::trace!("enter: generate_backup_urls({response:?})");
 
         let mut urls = vec![];
         let url = response.url();
 
         // confirmed safe: see src/response.rs for comments
-        let filename = url.path_segments().unwrap().last().unwrap();
+        let filename = url.path_segments().unwrap().next_back().unwrap();
 
         if !filename.is_empty() {
             // append rules
-            for suffix in ["~", ".bak", ".bak2", ".old", ".1"] {
+            for suffix in &self.config.backup_extensions {
                 self.add_new_url_to_vec(url, &format!("{filename}{suffix}"), &mut urls);
             }
 
@@ -405,7 +435,7 @@ impl TermOutHandler {
             }
         }
 
-        log::trace!("exit: generate_backup_urls -> {:?}", urls);
+        log::trace!("exit: generate_backup_urls -> {urls:?}");
         urls
     }
 }
@@ -480,7 +510,7 @@ mod tests {
 
         let paths: Vec<_> = urls
             .iter()
-            .map(|url| url.path_segments().unwrap().last().unwrap())
+            .map(|url| url.path_segments().unwrap().next_back().unwrap())
             .collect();
 
         assert_eq!(urls.len(), 7);
@@ -524,7 +554,7 @@ mod tests {
 
         let paths: Vec<_> = urls
             .iter()
-            .map(|url| url.path_segments().unwrap().last().unwrap())
+            .map(|url| url.path_segments().unwrap().next_back().unwrap())
             .collect();
 
         assert_eq!(urls.len(), 6);
