@@ -1,8 +1,8 @@
 Source: feroxbuster
 Section: misc
 Priority: optional
-Maintainer: Lorenzo "Palinuro" Faletra <palinuro@parrotsec.org>
-Uploaders: Lorenzo "Palinuro" Faletra <palinuro@parrotsec.org>
+Maintainer: Parrot Team <team@parrotsec.org>
+Uploaders: Leonardo "антракс_99" Tito <leotito201@outlook.com>
 Build-Depends: ca-certificates,
                cargo,
 		       rustc (>= 1.64),
@@ -10,6 +10,8 @@ Build-Depends: ca-certificates,
                help2man,
                libssl-dev
 Standards-Version: 4.6.2
+Vcs-Browser: https://gitlab.com/leotito201/feroxbuster
+Vcs-Git: https://gitlab.com/leotito201/feroxbuster.git
 Homepage: https://github.com/epi052/feroxbuster
 Rules-Requires-Root: no
 

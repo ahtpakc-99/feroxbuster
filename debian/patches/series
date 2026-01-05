@@ -1,3 +1,4 @@
+fix-rust-compatibility.patch
 fix-makefile.patch
 Fix-path-to-feroxbuster-command.patch
 remove-useless-copy.patch

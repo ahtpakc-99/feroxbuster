@@ -1,3 +1,11 @@
+feroxbuster (2.13.1-0parrot1) echo; urgency=medium
+
+  * New upstream version 2.13.1
+  * Fix build with Rust 1.83+ (removed is_multiple_of)
+  * Update Maintainer and Uploaders fields
+
+ -- Leonardo "антракс_99" Tito <leotito201@outlook.com>  Mon, 05 Jan 2026 11:25:00 -0300
+
 feroxbuster (2.10.0-0parrot1) lory; urgency=medium
 
   * Rebuild for Parrot 6.0.

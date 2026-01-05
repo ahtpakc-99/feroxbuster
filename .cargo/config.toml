@@ -1,5 +1,5 @@
-[target.armv7-unknown-linux-gnueabihf]
-linker = "arm-linux-gnueabihf-gcc"
+[source.crates-io]
+replace-with = "vendored-sources"
 
-[target.aarch64-unknown-linux-gnu]
-linker = "aarch64-linux-gnu-gcc"
+[source.vendored-sources]
+directory = "vendor"
