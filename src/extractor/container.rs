@@ -5,17 +5,18 @@ use crate::{
         Command::{AddError, AddToUsizeField},
         Handles,
     },
+    filters::SimilarityFilter,
     scan_manager::ScanOrder,
     statistics::{
         StatError::Other,
         StatField::{LinksExtracted, TotalExpected},
     },
-    url::FeroxUrl,
+    url::{FeroxUrl, UrlExt},
     utils::{
         logged_request, make_request, parse_url_with_raw_path, send_try_recursion_command,
         should_deny_url,
     },
-    ExtractionResult, DEFAULT_METHOD,
+    ExtractionResult, DEFAULT_METHOD, UNIQUE_DISTANCE,
 };
 use anyhow::{bail, Context, Result};
 use futures::StreamExt;
@@ -28,7 +29,7 @@ use std::{borrow::Cow, collections::HashSet};
 ///   - check if the new Url has already been seen/scanned -> None
 ///   - make a request to the new Url ? -> Some(response) : None
 pub(super) async fn request_link(url: &str, handles: Arc<Handles>) -> Result<Response> {
-    log::trace!("enter: request_link({})", url);
+    log::trace!("enter: request_link({url})");
 
     let ferox_url = FeroxUrl::from_string(url, handles.clone());
 
@@ -58,7 +59,7 @@ pub(super) async fn request_link(url: &str, handles: Arc<Handles>) -> Result<Res
     // make the request and store the response
     let new_response = logged_request(&new_url, DEFAULT_METHOD, None, handles.clone()).await?;
 
-    log::trace!("exit: request_link -> {:?}", new_response);
+    log::trace!("exit: request_link -> {new_response:?}");
 
     Ok(new_response)
 }
@@ -115,28 +116,24 @@ impl<'a> Extractor<'a> {
 
     /// wrapper around logic that performs the following:
     /// - parses `url_to_parse`
-    /// - bails if the parsed url doesn't belong to the original host/domain
+    /// - bails if the parsed url doesn't belong to the list of in-scope urls
     /// - otherwise, calls `add_all_sub_paths` with the parsed result
     fn parse_url_and_add_subpaths(
         &self,
         url_to_parse: &str,
-        original_url: &Url,
         links: &mut HashSet<String>,
     ) -> Result<()> {
-        log::trace!("enter: parse_url_and_add_subpaths({:?})", links);
+        log::trace!("enter: parse_url_and_add_subpaths({links:?})");
 
         match parse_url_with_raw_path(url_to_parse) {
             Ok(absolute) => {
-                if absolute.domain() != original_url.domain()
-                    || absolute.host() != original_url.host()
-                {
-                    // domains/ips are not the same, don't scan things that aren't part of the original
-                    // target url
-                    bail!("parsed url does not belong to original domain/host");
+                if !absolute.is_in_scope(&self.handles.config.scope) {
+                    // URL is not in scope based on domain/scope configuration
+                    bail!("parsed url is not in scope");
                 }
 
                 if self.add_all_sub_paths(absolute.path(), links).is_err() {
-                    log::warn!("could not add sub-paths from {} to {:?}", absolute, links);
+                    log::warn!("could not add sub-paths from {absolute} to {links:?}");
                 }
             }
             Err(e) => {
@@ -144,16 +141,15 @@ impl<'a> Extractor<'a> {
                 //     ex: Url::parse("/login") -> Err("relative URL without a base")
                 // while this is technically an error, these are good results for us
                 if e.to_string().contains("relative URL without a base") {
+                    // scope for these should be enforced in add_all_sub_paths since
+                    // we join the fragment with the base url there and can check
+                    // the full Url against scope
                     if self.add_all_sub_paths(url_to_parse, links).is_err() {
-                        log::warn!(
-                            "could not add sub-paths from {} to {:?}",
-                            url_to_parse,
-                            links
-                        );
+                        log::warn!("could not add sub-paths from {url_to_parse} to {links:?}");
                     }
                 } else {
                     // unexpected error has occurred
-                    log::warn!("Could not parse given url: {}", e);
+                    log::warn!("Could not parse given url: {e}");
                     self.handles.stats.send(AddError(Other)).unwrap_or_default();
                 }
             }
@@ -169,7 +165,7 @@ impl<'a> Extractor<'a> {
         &mut self,
         links: HashSet<String>,
     ) -> Result<Option<tokio::task::JoinHandle<()>>> {
-        log::trace!("enter: request_links({:?})", links);
+        log::trace!("enter: request_links({links:?})");
 
         if links.is_empty() {
             return Ok(None);
@@ -212,6 +208,7 @@ impl<'a> Extractor<'a> {
                                     &og_url,
                                     DEFAULT_METHOD,
                                     c_handles.config.output_level,
+                                    c_handles.config.response_size_limit,
                                 )
                                 .await;
 
@@ -224,12 +221,28 @@ impl<'a> Extractor<'a> {
                                     return;
                                 }
 
-                                // request and report assumed file
-                                if resp.is_file() || !resp.is_directory() {
-                                    log::debug!("Extracted File: {}", resp);
+                                if c_handles.config.unique {
+                                    // if the filter above didn't filter it out, add it as a unique filter
+                                    let mut unique_filter = SimilarityFilter::from(&resp);
+                                    unique_filter.cutoff = UNIQUE_DISTANCE;
+                                    c_handles
+                                        .filters
+                                        .data
+                                        .push(Box::new(unique_filter))
+                                        .unwrap_or_default();
+                                }
 
-                                    c_scanned_urls
-                                        .add_file_scan(resp.url().as_str(), ScanOrder::Latest);
+                                // request and report assumed file
+                                if (resp.is_file() || !resp.is_directory())
+                                    && !c_handles.config.force_recursion
+                                {
+                                    log::debug!("Extracted File: {resp}");
+
+                                    c_scanned_urls.add_file_scan(
+                                        resp.url().as_str(),
+                                        ScanOrder::Latest,
+                                        c_handles.clone(),
+                                    );
 
                                     if c_handles.config.collect_extensions {
                                         // no real reason this should fail
@@ -238,8 +251,7 @@ impl<'a> Extractor<'a> {
 
                                     if let Err(e) = resp.send_report(c_handles.output.tx.clone()) {
                                         log::warn!(
-                                            "Could not send FeroxResponse to output handler: {}",
-                                            e
+                                            "Could not send FeroxResponse to output handler: {e}"
                                         );
                                     }
 
@@ -247,7 +259,7 @@ impl<'a> Extractor<'a> {
                                 }
 
                                 if matches!(c_recursive, RecursionStatus::Recursive) {
-                                    log::debug!("Extracted Directory: {}", resp);
+                                    log::debug!("Extracted Directory: {resp}");
 
                                     if !resp.url().as_str().ends_with('/')
                                         && (resp.status().is_success()
@@ -284,10 +296,10 @@ impl<'a> Extractor<'a> {
                                 }
                             }
                             Ok(Err(err)) => {
-                                log::warn!("Error during link extraction: {}", err);
+                                log::warn!("Error during link extraction: {err}");
                             }
                             Err(err) => {
-                                log::warn!("JoinError during link extraction: {}", err);
+                                log::warn!("JoinError during link extraction: {err}");
                             }
                         }
                     },
@@ -346,10 +358,7 @@ impl<'a> Extractor<'a> {
             // capture[0] is the entire match, additional capture groups start at [1]
             let link = capture[0].trim_matches(|c| c == '\'' || c == '"');
 
-            if self
-                .parse_url_and_add_subpaths(link, response_url, links)
-                .is_err()
-            {
+            if self.parse_url_and_add_subpaths(link, links).is_err() {
                 // purposely not logging the error here, due to the frequency with which it gets hit
             }
         }
@@ -364,7 +373,7 @@ impl<'a> Extractor<'a> {
     ///   - homepage/assets/
     ///   - homepage/
     fn add_all_sub_paths(&self, url_path: &str, links: &mut HashSet<String>) -> Result<()> {
-        log::trace!("enter: add_all_sub_paths({}, {:?})", url_path, links);
+        log::trace!("enter: add_all_sub_paths({url_path}, {links:?})");
 
         for sub_path in self.get_sub_paths_from_path(url_path) {
             self.add_link_to_set_of_links(&sub_path, links)?;
@@ -377,7 +386,7 @@ impl<'a> Extractor<'a> {
     /// given a url path, trim whitespace, remove slashes, and queries/fragments; return the
     /// normalized string
     pub(super) fn normalize_url_path(&self, path: &str) -> String {
-        log::trace!("enter: normalize_url_path({})", path);
+        log::trace!("enter: normalize_url_path({path})");
 
         // remove whitespace and leading '/'
         let path_str: String = path
@@ -409,7 +418,7 @@ impl<'a> Extractor<'a> {
                 path_str.split_once('#').unwrap_or((&path_str, ""))
             });
 
-        log::trace!("exit: normalize_url_path -> {}", path_str);
+        log::trace!("exit: normalize_url_path -> {path_str}");
         path_str.into()
     }
 
@@ -423,7 +432,7 @@ impl<'a> Extractor<'a> {
     ///   - homepage/assets/
     ///   - homepage/
     pub(super) fn get_sub_paths_from_path(&self, path: &str) -> Vec<String> {
-        log::trace!("enter: get_sub_paths_from_path({})", path);
+        log::trace!("enter: get_sub_paths_from_path({path})");
         let mut paths = vec![];
 
         let normalized_path = self.normalize_url_path(path);
@@ -462,7 +471,7 @@ impl<'a> Extractor<'a> {
             parts.pop(); // use .pop() to remove the last part of the path and continue iteration
         }
 
-        log::trace!("exit: get_sub_paths_from_path -> {:?}", paths);
+        log::trace!("exit: get_sub_paths_from_path -> {paths:?}");
         paths
     }
 
@@ -472,7 +481,7 @@ impl<'a> Extractor<'a> {
         link: &str,
         links: &mut HashSet<String>,
     ) -> Result<()> {
-        log::trace!("enter: add_link_to_set_of_links({}, {:?})", link, links);
+        log::trace!("enter: add_link_to_set_of_links({link}, {links:?})");
 
         let old_url = match self.target {
             ExtractionTarget::ResponseBody | ExtractionTarget::DirectoryListing => {
@@ -490,13 +499,9 @@ impl<'a> Extractor<'a> {
             .join(link)
             .with_context(|| format!("Could not join {old_url} with {link}"))?;
 
-        if old_url.domain() != new_url.domain() || old_url.host() != new_url.host() {
-            // domains/ips are not the same, don't scan things that aren't part of the original
-            // target url
-            log::debug!(
-                "Skipping {} because it's not part of the original target",
-                new_url
-            );
+        if !new_url.is_in_scope(&self.handles.config.scope) {
+            // URL is not in scope based on domain/scope configuration
+            log::debug!("Skipping {new_url} because it's not in scope");
             log::trace!("exit: add_link_to_set_of_links");
             return Ok(());
         }
@@ -532,12 +537,12 @@ impl<'a> Extractor<'a> {
                 new_url.set_path(new_path.as_str());
 
                 if self.add_all_sub_paths(new_url.path(), &mut result).is_err() {
-                    log::warn!("could not add sub-paths from {} to {:?}", new_url, result);
+                    log::warn!("could not add sub-paths from {new_url} to {result:?}");
                 }
             }
         }
 
-        log::trace!("exit: extract_robots_txt -> {:?}", result);
+        log::trace!("exit: extract_robots_txt -> {result:?}");
         Ok(result)
     }
 
@@ -561,7 +566,7 @@ impl<'a> Extractor<'a> {
         self.extract_all_links_from_html_tags(resp_url, &mut result, &html);
         self.extract_all_links_from_javascript(body, resp_url, &mut result);
 
-        log::trace!("exit: extract_from_body -> {:?}", result);
+        log::trace!("exit: extract_from_body -> {result:?}");
         Ok(result)
     }
 
@@ -580,7 +585,7 @@ impl<'a> Extractor<'a> {
 
         self.extract_links_by_attr(response.url(), &mut result, &html, "a", "href");
 
-        log::trace!("exit: extract_from_dir_listing -> {:?}", result);
+        log::trace!("exit: extract_from_dir_listing -> {result:?}");
         Ok(result)
     }
 
@@ -595,7 +600,10 @@ impl<'a> Extractor<'a> {
     ) {
         log::trace!("enter: extract_links_by_attr");
 
-        let selector = Selector::parse(html_tag).unwrap();
+        let Some(selector) = Selector::parse(html_tag).ok() else {
+            log::warn!("Failed to parse selector for tag: {html_tag}");
+            return;
+        };
 
         let tags = html
             .select(&selector)
@@ -605,11 +613,8 @@ impl<'a> Extractor<'a> {
             if let Some(link) = tag.value().attr(html_attr) {
                 log::debug!("Parsed link \"{}\" from {}", link, resp_url.as_str());
 
-                if self
-                    .parse_url_and_add_subpaths(link, resp_url, links)
-                    .is_err()
-                {
-                    log::debug!("link didn't belong to the target domain/host: {}", link);
+                if self.parse_url_and_add_subpaths(link, links).is_err() {
+                    log::debug!("link didn't belong to the target domain/host: {link}");
                 }
             }
         }
@@ -655,17 +660,19 @@ impl<'a> Extractor<'a> {
                 Some(self.handles.config.client_key.as_str())
             };
 
-            client = client::initialize(
-                self.handles.config.timeout,
-                &self.handles.config.user_agent,
-                follow_redirects,
-                self.handles.config.insecure,
-                &self.handles.config.headers,
+            let client_config = client::ClientConfig {
+                timeout: self.handles.config.timeout,
+                user_agent: &self.handles.config.user_agent,
+                redirects: follow_redirects,
+                insecure: self.handles.config.insecure,
+                headers: &self.handles.config.headers,
                 proxy,
-                server_certs,
+                server_certs: Some(server_certs),
                 client_cert,
                 client_key,
-            )?;
+                scope: &self.handles.config.scope,
+            };
+            client = client::initialize(client_config)?;
         }
 
         let client = if location != "/robots.txt" {
@@ -694,11 +701,12 @@ impl<'a> Extractor<'a> {
             &self.url,
             DEFAULT_METHOD,
             self.handles.config.output_level,
+            self.handles.config.response_size_limit,
         )
         .await;
         // note: don't call parse_extension here. If we call it here, it gets called on robots.txt
 
-        log::trace!("exit: make_extract_request -> {}", ferox_response);
+        log::trace!("exit: make_extract_request -> {ferox_response}");
         Ok(ferox_response)
     }
 

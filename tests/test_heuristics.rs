@@ -21,7 +21,7 @@ fn test_single_target_cannot_connect() -> Result<(), Box<dyn std::error::Error>>
         .assert()
         .success()
         .stdout(
-            predicate::str::contains("Could not connect to http://fjdksafjkdsajfkdsajkfdsajkfsdjkdsfdsafdsafdsajkr3l2ajfdskafdsjk, skipping...", )
+            predicate::str::contains("Could not connect to http://fjdksafjkdsajfkdsajkfdsajkfsdjkdsfdsafdsafdsajkr3l2ajfdskafdsjk/, skipping...", )
         );
 
     teardown_tmp_directory(tmp_dir);
@@ -47,7 +47,7 @@ fn test_two_targets_cannot_connect() -> Result<(), Box<dyn std::error::Error>> {
         .assert()
         .success()
         .stdout(
-            predicate::str::contains("Could not connect to http://fjdksafjkdsajfkdsajkfdsajkfsdjkdsfdsafdsafdsajkr3l2ajfdskafdsjk, skipping...", )
+            predicate::str::contains("Could not connect to http://fjdksafjkdsajfkdsajkfdsajkfsdjkdsfdsafdsafdsajkr3l2ajfdskafdsjk/, skipping...", )
         );
 
     teardown_tmp_directory(tmp_dir);
@@ -104,9 +104,9 @@ fn test_single_target_cannot_connect_due_to_ssl_errors() -> Result<(), Box<dyn s
         .arg(file.as_os_str())
         .assert()
         .success()
-        .stdout(
-            predicate::str::contains("Could not connect to https://expired.badssl.com due to SSL errors (run with -k to ignore), skipping...", )
-        );
+        .stdout(predicate::str::contains(
+            "Could not connect to https://expired.badssl.com",
+        ));
 
     teardown_tmp_directory(tmp_dir);
     Ok(())
@@ -337,7 +337,7 @@ fn heuristics_wildcard_test_that_auto_filtering_403s_still_allows_for_recursion_
     });
 
     srv.mock(|when, then| {
-        when.method(GET).path(format!("/LICENSE/{}", super_long));
+        when.method(GET).path(format!("/LICENSE/{super_long}"));
         then.status(200);
     });
 

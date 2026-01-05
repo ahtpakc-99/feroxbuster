@@ -7,10 +7,10 @@ use console::style;
 use futures::{stream, StreamExt};
 use indicatif::ProgressBar;
 use lazy_static::lazy_static;
-use tokio::sync::Semaphore;
 
 use crate::filters::{create_similarity_filter, EmptyFilter, SimilarityFilter};
 use crate::heuristics::WildcardResult;
+use crate::sync::DynamicSemaphore;
 use crate::Command::AddFilter;
 use crate::{
     event_handlers::{
@@ -43,28 +43,26 @@ async fn check_for_user_input(
     pause_flag: &AtomicBool,
     scanned_urls: Arc<FeroxScans>,
     handles: Arc<Handles>,
+    limiter: Arc<DynamicSemaphore>,
 ) {
-    log::trace!(
-        "enter: check_for_user_input({:?}, SCANNED_URLS, HANDLES)",
-        pause_flag
-    );
+    log::trace!("enter: check_for_user_input({pause_flag:?}, SCANNED_URLS, HANDLES)",);
 
     // todo write a test or two for this function at some point...
     if pause_flag.load(Ordering::Acquire) {
-        match scanned_urls.pause(true, handles.clone()).await {
+        match scanned_urls.pause(true, handles.clone(), limiter).await {
             Some(MenuCmdResult::Url(url)) => {
                 // user wants to add a new url to be scanned, need to send
                 // it over to the event handler for processing
                 handles
                     .send_scan_command(Command::ScanNewUrl(url))
-                    .unwrap_or_else(|e| log::warn!("Could not add scan to scan queue: {}", e))
+                    .unwrap_or_else(|e| log::warn!("Could not add scan to scan queue: {e}"))
             }
             Some(MenuCmdResult::NumCancelled(num_canx)) => {
                 if num_canx > 0 {
                     handles
                         .stats
                         .send(SubtractFromUsizeField(TotalExpected, num_canx))
-                        .unwrap_or_else(|e| log::warn!("Could not update overall scan bar: {}", e));
+                        .unwrap_or_else(|e| log::warn!("Could not update overall scan bar: {e}"));
                 }
             }
             Some(MenuCmdResult::Filter(mut filter)) => {
@@ -97,7 +95,17 @@ async fn check_for_user_input(
                 handles
                     .filters
                     .send(AddFilter(filter))
-                    .unwrap_or_else(|e| log::warn!("Could not add new filter: {}", e));
+                    .unwrap_or_else(|e| log::warn!("Could not add new filter: {e}"));
+            }
+            Some(MenuCmdResult::NumPermitsToAdd(num_permits)) => {
+                handles
+                    .send_scan_command(Command::AddScanPermits(num_permits))
+                    .unwrap_or_else(|e| log::warn!("Could not increase scan limit: {e}"));
+            }
+            Some(MenuCmdResult::NumPermitsToSubtract(num_permits)) => {
+                handles
+                    .send_scan_command(Command::SubtractScanPermits(num_permits))
+                    .unwrap_or_else(|e| log::warn!("Could not decrease scan limit: {e}"));
             }
             _ => {}
         }
@@ -121,7 +129,7 @@ pub struct FeroxScanner {
     wordlist: Arc<Vec<String>>,
 
     /// limiter that restricts the number of active FeroxScanners
-    scan_limiter: Arc<Semaphore>,
+    scan_limiter: Arc<DynamicSemaphore>,
 }
 
 /// FeroxScanner implementation
@@ -131,7 +139,7 @@ impl FeroxScanner {
         target_url: &str,
         order: ScanOrder,
         wordlist: Arc<Vec<String>>,
-        scan_limiter: Arc<Semaphore>,
+        scan_limiter: Arc<DynamicSemaphore>,
         handles: Arc<Handles>,
     ) -> Self {
         Self {
@@ -159,17 +167,25 @@ impl FeroxScanner {
                 let scanned_urls_clone = scanned_urls.clone();
                 let requester_clone = requester.clone();
                 let handles_clone = self.handles.clone();
+                let limiter_clone = self.scan_limiter.clone();
+
                 (
                     tokio::spawn(async move {
                         // for every word in the wordlist, check to see if user has pressed enter
                         // in order to go into the interactive menu
-                        check_for_user_input(&PAUSE_SCAN, scanned_urls_clone, handles_clone).await;
+                        check_for_user_input(
+                            &PAUSE_SCAN,
+                            scanned_urls_clone,
+                            handles_clone,
+                            limiter_clone,
+                        )
+                        .await;
 
                         // after checking for user input, send the request
                         requester_clone
                             .request(&word)
                             .await
-                            .unwrap_or_else(|e| log::warn!("Requester encountered an error: {}", e))
+                            .unwrap_or_else(|e| log::warn!("Requester encountered an error: {e}"))
                     }),
                     pb,
                 )
@@ -181,7 +197,7 @@ impl FeroxScanner {
                         bar.inc(increment_len);
                     }
                     Err(e) => {
-                        log::warn!("error awaiting a response: {}", e);
+                        log::warn!("error awaiting a response: {e}");
                         self.handles.stats.send(AddError(Other)).unwrap_or_default();
                         std::process::exit(1);
                     }
@@ -214,17 +230,14 @@ impl FeroxScanner {
                 .url(&self.target_url)
                 .handles(self.handles.clone())
                 .build()?;
-
-            let result = extractor.extract().await?;
-            extraction_tasks.push(extractor.request_links(result).await?)
+            if let Ok(result) = extractor.extract().await {
+                extraction_tasks.push(extractor.request_links(result).await?)
+            }
         }
 
         let scanned_urls = self.handles.ferox_scans()?;
         let ferox_scan = match scanned_urls.get_scan_by_url(&self.target_url) {
-            Some(scan) => {
-                scan.set_status(ScanStatus::Running)?;
-                scan
-            }
+            Some(scan) => scan,
             None => {
                 let msg = format!(
                     "Could not find FeroxScan associated with {}; this shouldn't happen... exiting",
@@ -240,7 +253,10 @@ impl FeroxScanner {
         // returns a permit. However, if no remaining permits are available, acquire (asynchronously)
         // waits until an outstanding permit is dropped, at which point, the freed permit is assigned
         // to the caller.
+        ferox_scan.set_status(ScanStatus::Waiting)?;
         let _permit = self.scan_limiter.acquire().await;
+        ferox_scan.set_status(ScanStatus::Running)?;
+        ferox_scan.set_start_time(Instant::now())?;
 
         if self.handles.config.scan_limit > 0 {
             scan_timer = Instant::now();
@@ -251,60 +267,72 @@ impl FeroxScanner {
             // heuristics test block:
             let test = heuristics::HeuristicTests::new(self.handles.clone());
 
-            if let Ok(dirlist_result) = test.directory_listing(&self.target_url).await {
-                if dirlist_result.is_some() {
-                    let dirlist_result = dirlist_result.unwrap();
-                    // at this point, we have a DirListingType, and it's not the None variant
-                    // which means we found directory listing based on the heuristic; now we need
-                    // to process the links that are available if --extract-links was used
+            if let Ok(Some(dirlist_result)) = test.directory_listing(&self.target_url).await {
+                // at this point, we have a DirListingType, and it's not the None variant
+                // which means we found directory listing based on the heuristic; now we need
+                // to process the links that are available if --extract-links was used
 
-                    if self.handles.config.extract_links {
-                        let mut extractor = ExtractorBuilder::default()
-                            .response(&dirlist_result.response)
-                            .target(ExtractionTarget::DirectoryListing)
-                            .url(&self.target_url)
-                            .handles(self.handles.clone())
-                            .build()?;
+                if self.handles.config.extract_links {
+                    let mut extractor = ExtractorBuilder::default()
+                        .response(&dirlist_result.response)
+                        .target(ExtractionTarget::DirectoryListing)
+                        .url(&self.target_url)
+                        .handles(self.handles.clone())
+                        .build()?;
 
-                        let result = extractor.extract_from_dir_listing().await?;
+                    let result = extractor.extract_from_dir_listing().await?;
 
-                        extraction_tasks.push(extractor.request_links(result).await?);
+                    extraction_tasks.push(extractor.request_links(result).await?);
 
-                        log::trace!("exit: scan_url -> Directory listing heuristic");
+                    log::trace!("exit: scan_url -> Directory listing heuristic");
 
-                        self.handles.stats.send(AddToF64Field(
-                            DirScanTimes,
-                            scan_timer.elapsed().as_secs_f64(),
-                        ))?;
+                    self.handles.stats.send(AddToF64Field(
+                        DirScanTimes,
+                        scan_timer.elapsed().as_secs_f64(),
+                    ))?;
 
-                        self.handles.stats.send(SubtractFromUsizeField(
-                            TotalExpected,
-                            progress_bar.length().unwrap_or(0) as usize,
-                        ))?;
+                    self.handles.stats.send(SubtractFromUsizeField(
+                        TotalExpected,
+                        progress_bar.length().unwrap_or(0) as usize,
+                    ))?;
+                }
+
+                let mut message = format!("=> {}", style("Directory listing").blue().bright());
+
+                if !self.handles.config.scan_dir_listings {
+                    write!(
+                        message,
+                        " (add {} to scan)",
+                        style("--scan-dir-listings").bright().yellow()
+                    )?;
+                }
+
+                if !self.handles.config.extract_links {
+                    write!(
+                        message,
+                        " (remove {} to scan)",
+                        style("--dont-extract-links").bright().yellow()
+                    )?;
+                }
+
+                if !self.handles.config.force_recursion && !self.handles.config.scan_dir_listings {
+                    for handle in extraction_tasks.into_iter().flatten() {
+                        _ = handle.await;
                     }
 
-                    let mut message = format!("=> {}", style("Directory listing").blue().bright());
+                    progress_bar.reset_eta();
+                    progress_bar.finish_with_message(message);
 
-                    if !self.handles.config.extract_links {
-                        write!(
-                            message,
-                            " (remove {} to scan)",
-                            style("--dont-extract-links").bright().yellow()
-                        )?;
+                    if self.handles.config.limit_bars > 0 {
+                        let scans = self.handles.ferox_scans()?;
+                        let num_bars = scans.number_of_bars();
+                        ferox_scan.finish(num_bars)?;
+                        scans.make_visible();
+                    } else {
+                        ferox_scan.finish(0)?;
                     }
 
-                    if !self.handles.config.force_recursion {
-                        for handle in extraction_tasks.into_iter().flatten() {
-                            _ = handle.await;
-                        }
-
-                        progress_bar.reset_eta();
-                        progress_bar.finish_with_message(message);
-
-                        ferox_scan.finish()?;
-
-                        return Ok(()); // nothing left to do if we found a dir listing
-                    }
+                    return Ok(()); // nothing left to do if we found a dir listing
                 }
             }
 
@@ -385,7 +413,14 @@ impl FeroxScanner {
             _ = handle.await;
         }
 
-        ferox_scan.finish()?;
+        if self.handles.config.limit_bars > 0 {
+            let scans = self.handles.ferox_scans()?;
+            let num_bars = scans.number_of_bars();
+            ferox_scan.finish(num_bars)?;
+            scans.make_visible();
+        } else {
+            ferox_scan.finish(0)?;
+        }
 
         log::trace!("exit: scan_url");
 

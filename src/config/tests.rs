@@ -38,6 +38,7 @@ fn setup_config_test() -> Configuration {
             methods = ["GET", "PUT", "DELETE"]
             data = [31, 32, 33, 34]
             url_denylist = ["http://dont-scan.me", "https://also-not.me"]
+            scope = ["http://example.com", "https://other.com"]
             regex_denylist = ["/deny.*"]
             headers = {stuff = "things", mostuff = "mothings"}
             queries = [["name","value"], ["rick", "astley"]]
@@ -49,6 +50,10 @@ fn setup_config_test() -> Configuration {
             json = true
             save_state = false
             depth = 1
+            limit_bars = 3
+            protocol = "http"
+            request_file = "/some/request/file"
+            scan_dir_listings = true
             force_recursion = true
             filter_size = [4120]
             filter_regex = ["^ignore me$"]
@@ -59,6 +64,9 @@ fn setup_config_test() -> Configuration {
             server_certs = ["/some/cert.pem", "/some/other/cert.pem"]
             client_cert = "/some/client/cert.pem"
             client_key = "/some/client/key.pem"
+            backup_extensions = [".save"]
+            unique = true
+            response_size_limit = 8388608
         "#;
     let tmp_dir = TempDir::new().unwrap();
     let file = tmp_dir.path().join(DEFAULT_CONFIG_NAME);
@@ -86,6 +94,7 @@ fn default_configuration() {
     assert_eq!(config.timeout, timeout());
     assert_eq!(config.verbosity, 0);
     assert_eq!(config.scan_limit, 0);
+    assert_eq!(config.limit_bars, 0);
     assert!(!config.silent);
     assert!(!config.quiet);
     assert_eq!(config.output_level, OutputLevel::Default);
@@ -106,6 +115,7 @@ fn default_configuration() {
     assert!(!config.collect_extensions);
     assert!(!config.collect_backups);
     assert!(!config.collect_words);
+    assert!(!config.scan_dir_listings);
     assert!(config.regex_denylist.is_empty());
     assert_eq!(config.queries, Vec::new());
     assert_eq!(config.filter_size, Vec::<u64>::new());
@@ -113,6 +123,7 @@ fn default_configuration() {
     assert_eq!(config.methods, vec!["GET"]);
     assert_eq!(config.data, Vec::<u8>::new());
     assert_eq!(config.url_denylist, Vec::<Url>::new());
+    assert_eq!(config.scope, Vec::<Url>::new());
     assert_eq!(config.dont_collect, ignored_extensions());
     assert_eq!(config.filter_regex, Vec::<String>::new());
     assert_eq!(config.filter_similar, Vec::<String>::new());
@@ -123,6 +134,11 @@ fn default_configuration() {
     assert_eq!(config.server_certs, Vec::<String>::new());
     assert_eq!(config.client_cert, String::new());
     assert_eq!(config.client_key, String::new());
+    assert_eq!(config.backup_extensions, backup_extensions());
+    assert_eq!(config.protocol, request_protocol());
+    assert_eq!(config.request_file, String::new());
+    assert!(!config.unique);
+    assert_eq!(config.response_size_limit, 4194304); // 4MB
 }
 
 #[test]
@@ -260,6 +276,13 @@ fn config_reads_verbosity() {
 
 #[test]
 /// parse the test config and see that the value parsed is correct
+fn config_reads_limit_bars() {
+    let config = setup_config_test();
+    assert_eq!(config.limit_bars, 3);
+}
+
+#[test]
+/// parse the test config and see that the value parsed is correct
 fn config_reads_output() {
     let config = setup_config_test();
     assert_eq!(config.output, "/some/otherpath");
@@ -388,6 +411,19 @@ fn config_reads_url_denylist() {
 
 #[test]
 /// parse the test config and see that the value parsed is correct
+fn config_reads_scope() {
+    let config = setup_config_test();
+    assert_eq!(
+        config.scope,
+        vec![
+            Url::parse("http://example.com").unwrap(),
+            Url::parse("https://other.com").unwrap(),
+        ]
+    );
+}
+
+#[test]
+/// parse the test config and see that the value parsed is correct
 fn config_reads_filter_regex() {
     let config = setup_config_test();
     assert_eq!(config.filter_regex, vec!["^ignore me$"]);
@@ -444,6 +480,27 @@ fn config_reads_time_limit() {
 
 #[test]
 /// parse the test config and see that the value parsed is correct
+fn config_reads_scan_dir_listings() {
+    let config = setup_config_test();
+    assert!(config.scan_dir_listings);
+}
+
+#[test]
+/// parse the test config and see that the value parsed is correct
+fn config_reads_protocol() {
+    let config = setup_config_test();
+    assert_eq!(config.protocol, "http");
+}
+
+#[test]
+/// parse the test config and see that the value parsed is correct
+fn config_reads_request_file() {
+    let config = setup_config_test();
+    assert_eq!(config.request_file, String::new());
+}
+
+#[test]
+/// parse the test config and see that the value parsed is correct
 fn config_reads_resume_from() {
     let config = setup_config_test();
     assert_eq!(config.resume_from, "/some/state/file");
@@ -457,6 +514,13 @@ fn config_reads_server_certs() {
         config.server_certs,
         ["/some/cert.pem", "/some/other/cert.pem"]
     );
+}
+
+#[test]
+/// parse the test config and see that the value parsed is correct
+fn config_reads_backup_extensions() {
+    let config = setup_config_test();
+    assert_eq!(config.backup_extensions, [".save"]);
 }
 
 #[test]
@@ -533,4 +597,18 @@ fn as_json_returns_json_representation_of_configuration_with_newline() {
     assert_eq!(json.replay_codes, config.replay_codes);
     assert_eq!(json.timeout, config.timeout);
     assert_eq!(json.depth, config.depth);
+}
+
+#[test]
+/// parse the test config and see that the value parsed is correct
+fn config_reads_unique() {
+    let config = setup_config_test();
+    assert!(config.unique);
+}
+
+#[test]
+/// parse the test config and see that the value parsed is correct
+fn config_reads_response_size_limit() {
+    let config = setup_config_test();
+    assert_eq!(config.response_size_limit, 8388608); // 8MB as set in setup_config_test
 }

@@ -124,6 +124,9 @@ pub struct Stats {
     /// tracker for number of errors related to the request used
     request_errors: AtomicUsize,
 
+    /// tracker for number of certificate/TLS/SSL errors
+    certificate_errors: AtomicUsize,
+
     /// tracker for each directory's total scan time in seconds as a float
     directory_scan_times: Mutex<Vec<f64>>,
 
@@ -132,6 +135,9 @@ pub struct Stats {
 
     /// tracker for whether to use json during serialization or not
     json: bool,
+
+    /// tracker for the initial targets that were passed in to the scan
+    targets: Mutex<Vec<String>>,
 }
 
 /// FeroxSerialize implementation for Stats
@@ -194,8 +200,10 @@ impl Serialize for Stats {
         state.serialize_field("redirection_errors", &atomic_load!(self.redirection_errors))?;
         state.serialize_field("connection_errors", &atomic_load!(self.connection_errors))?;
         state.serialize_field("request_errors", &atomic_load!(self.request_errors))?;
+        state.serialize_field("certificate_errors", &atomic_load!(self.certificate_errors))?;
         state.serialize_field("directory_scan_times", &self.directory_scan_times)?;
         state.serialize_field("total_runtime", &self.total_runtime)?;
+        state.serialize_field("targets", &self.targets)?;
 
         state.end()
     }
@@ -446,6 +454,17 @@ impl<'a> Deserialize<'a> for Stats {
                         }
                     }
                 }
+                "targets" => {
+                    if let Some(arr) = value.as_array() {
+                        for val in arr {
+                            if let Some(parsed) = val.as_str() {
+                                if let Ok(mut guard) = stats.targets.lock() {
+                                    guard.push(parsed.to_string())
+                                }
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -514,6 +533,13 @@ impl Stats {
         }
     }
 
+    /// update targets with the given vector of strings
+    pub fn update_targets(&self, targets: Vec<String>) {
+        if let Ok(mut locked_targets) = self.targets.lock() {
+            *locked_targets = targets;
+        }
+    }
+
     /// save an instance of `Stats` to disk after updating the total runtime for the scan
     pub fn save(&self, seconds: f64, location: &str) -> Result<()> {
         let mut file = open_file(location)?;
@@ -549,6 +575,9 @@ impl Stats {
             }
             StatError::Request => {
                 atomic_increment!(self.request_errors);
+            }
+            StatError::Certificate => {
+                atomic_increment!(self.certificate_errors);
             }
             _ => {} // no need to hit Other as we always increment self.errors anyway
         }

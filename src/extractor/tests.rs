@@ -51,7 +51,12 @@ fn setup_extractor(target: ExtractionTarget, scanned_urls: Arc<FeroxScans>) -> E
             .target(ExtractionTarget::DirectoryListing),
     };
 
-    let config = Arc::new(Configuration::new().unwrap());
+    // need to add scope to the config to allow extracted links to make it through the
+    // full pipeline
+    let mut config = Configuration::new().unwrap();
+    config.scope.push(Url::parse("http://localhost").unwrap());
+
+    let config = Arc::new(config);
     let handles = Arc::new(Handles::for_testing(Some(scanned_urls), Some(config)).0);
 
     builder.handles(handles).build().unwrap()
@@ -268,8 +273,14 @@ async fn extractor_get_links_with_absolute_url_that_differs_from_target_domain()
     let (handles, _rx) = Handles::for_testing(None, None);
 
     let handles = Arc::new(handles);
-    let ferox_response =
-        FeroxResponse::from(response, &srv.url(""), DEFAULT_METHOD, OutputLevel::Default).await;
+    let ferox_response = FeroxResponse::from(
+        response,
+        &srv.url(""),
+        DEFAULT_METHOD,
+        OutputLevel::Default,
+        4194304,
+    )
+    .await;
 
     let extractor = Extractor {
         links_regex: Regex::new(LINKFINDER_REGEX).unwrap(),
@@ -386,7 +397,11 @@ async fn request_link_bails_on_seen_url() -> Result<()> {
     });
 
     let scans = Arc::new(FeroxScans::default());
-    scans.add_file_scan(&served, ScanOrder::Latest);
+    scans.add_file_scan(
+        &served,
+        ScanOrder::Latest,
+        Arc::new(Handles::for_testing(None, None).0),
+    );
 
     let robots = setup_extractor(ExtractionTarget::RobotsTxt, scans.clone());
     let body = setup_extractor(ExtractionTarget::ResponseBody, scans);

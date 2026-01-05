@@ -77,7 +77,7 @@ impl StatsHandler {
     ///
     /// The consumer simply receives `StatCommands` and updates the given `Stats` object as appropriate
     async fn start(&mut self, output_file: &str) -> Result<()> {
-        log::trace!("enter: start({:?})", self);
+        log::trace!("enter: start({self:?})");
 
         let start = Instant::now();
 
@@ -125,6 +125,12 @@ impl StatsHandler {
                 Command::Sync(sender) => {
                     sender.send(true).unwrap_or_default();
                 }
+                Command::QueryOverallBarEta(sender) => {
+                    sender.send(self.bar.eta()).unwrap_or_default();
+                }
+                Command::UpdateTargets(targets) => {
+                    self.stats.update_targets(targets);
+                }
                 Command::Exit => break,
                 _ => {} // no more commands needed
             }
@@ -132,7 +138,7 @@ impl StatsHandler {
 
         self.bar.finish();
 
-        log::debug!("{:#?}", *self.stats);
+        log::info!("{:#?}", *self.stats);
         log::trace!("exit: start");
         Ok(())
     }
@@ -170,7 +176,7 @@ impl StatsHandler {
 
         let event_handle = StatsHandle::new(data, tx);
 
-        log::trace!("exit: initialize -> ({:?}, {:?})", task, event_handle);
+        log::trace!("exit: initialize -> ({task:?}, {event_handle:?})");
 
         (task, event_handle)
     }

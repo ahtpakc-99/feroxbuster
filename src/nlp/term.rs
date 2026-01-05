@@ -22,6 +22,15 @@ impl Term {
 }
 
 /// metadata to be associated with a `Term`
+///
+/// # Design Note
+///
+/// The `count` field represents the number of times a term appeared in a **single document**
+/// and is only meaningful in the per-document context (i.e., within a `Document`).
+///
+/// When `TermMetaData` is stored in the global `TfIdf` model, the `count` field becomes stale
+/// and is not used. Instead, the model relies on `term_frequencies` (which tracks the term
+/// frequency for each document the term appears in) and calculates TF-IDF scores from those.
 #[derive(Debug, Clone, Default)]
 pub(super) struct TermMetaData {
     /// number of times the associated `Term` was seen in a single document
@@ -35,11 +44,6 @@ pub(super) struct TermMetaData {
 }
 
 impl TermMetaData {
-    /// create a new metadata container
-    pub(super) fn new() -> Self {
-        Self::default()
-    }
-
     /// number of times a `Term` has appeared in any `Document` within the corpus
     pub(super) fn document_frequency(&self) -> usize {
         self.term_frequencies().len()
@@ -90,7 +94,7 @@ mod tests {
     #[test]
     /// test accessors for correctness
     fn nlp_term_metadata_accessor_test() {
-        let mut metadata = TermMetaData::new();
+        let mut metadata = TermMetaData::default();
 
         *metadata.count_mut() += 1;
         assert_eq!(metadata.count(), 1);

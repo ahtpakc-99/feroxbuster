@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use reqwest::StatusCode;
 use tokio::sync::oneshot::Sender;
@@ -85,4 +86,16 @@ pub enum Command {
     /// Give a handler access to an Arc<Handles> instance after the handler has
     /// already been initialized
     AddHandles(Arc<Handles>),
+
+    /// inform the Stats object about which targets are being scanned
+    UpdateTargets(Vec<String>),
+
+    /// query the Stats handler about the position of the overall progress bar
+    QueryOverallBarEta(Sender<Duration>),
+
+    /// Add permits to the scan limiter (semaphore)
+    AddScanPermits(usize),
+
+    /// Subtract permits from the scan limiter (semaphore)
+    SubtractScanPermits(usize),
 }

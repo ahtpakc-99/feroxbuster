@@ -6,6 +6,7 @@ use reqwest::{Client, Method, Response, StatusCode, Url};
 #[cfg(not(target_os = "windows"))]
 use rlimit::{getrlimit, setrlimit, Resource};
 use std::{
+    error::Error,
     fs,
     io::{self, BufWriter, Write},
     sync::Arc,
@@ -24,7 +25,7 @@ use crate::{
     progress::PROGRESS_PRINTER,
     response::FeroxResponse,
     send_command,
-    statistics::StatError::{Connection, Other, Redirection, Request, Timeout},
+    statistics::StatError::{Certificate, Connection, Other, Redirection, Request, Timeout},
     traits::FeroxSerialize,
     USER_AGENTS,
 };
@@ -32,10 +33,67 @@ use crate::{
 /// simple counter for grabbing 'random' user agents
 static mut USER_AGENT_CTR: usize = 0;
 
+/// detects certificate-related errors by analyzing the error chain
+fn is_certificate_error(error: &reqwest::Error) -> bool {
+    let full_error = format!("{error:?}").to_lowercase();
+    let error_msg = error.to_string().to_lowercase();
+
+    // check the main error message first
+    if error_msg.contains("certificate verify failed")
+        || error_msg.contains("self-signed certificate")
+        || error_msg.contains("certificate has expired")
+        || error_msg.contains("hostname mismatch")
+        || error_msg.contains("certificate")
+    {
+        return true;
+    }
+
+    // check the full debug representation for OpenSSL patterns
+    if full_error.contains("ssl routines")
+        || full_error.contains("certificate verify failed")
+        || full_error.contains("self-signed certificate")
+        || full_error.contains("certificate has expired")
+        || full_error.contains("hostname mismatch")
+        || full_error.contains("tls_post_process_server_certificate")
+        || full_error.contains("certificate")
+        || full_error.contains("cert")
+    {
+        return true;
+    }
+
+    // walk the error source chain to find underlying TLS/certificate errors
+    let mut source = error.source();
+    while let Some(err) = source {
+        let source_msg = err.to_string().to_lowercase();
+
+        // check for specific OpenSSL certificate error patterns
+        if source_msg.contains("ssl routines")
+            || source_msg.contains("certificate verify failed")
+            || source_msg.contains("self-signed certificate")
+            || source_msg.contains("certificate has expired")
+            || source_msg.contains("hostname mismatch")
+            || source_msg.contains("unable to get local issuer certificate")
+            || source_msg.contains("certificate is not yet valid")
+            || source_msg.contains("invalid certificate")
+            || source_msg.contains("unknown ca")
+            || source_msg.contains("certificate")
+            || source_msg.contains("cert")
+            || source_msg.contains("tls")
+            || source_msg.contains("ssl")
+        {
+            return true;
+        }
+
+        source = err.source();
+    }
+
+    false
+}
+
 /// Given the path to a file, open the file in append mode (create it if it doesn't exist) and
 /// return a reference to the buffered file
 pub fn open_file(filename: &str) -> Result<BufWriter<fs::File>> {
-    log::trace!("enter: open_file({})", filename);
+    log::trace!("enter: open_file({filename})");
 
     let file = fs::OpenOptions::new() // std fs
         .create(true)
@@ -45,7 +103,7 @@ pub fn open_file(filename: &str) -> Result<BufWriter<fs::File>> {
 
     let writer = BufWriter::new(file); // std io
 
-    log::trace!("exit: open_file -> {:?}", writer);
+    log::trace!("exit: open_file -> {writer:?}");
     Ok(writer)
 }
 
@@ -66,6 +124,20 @@ pub fn status_colorizer(status: &str) -> String {
 /// simple wrapper to stay DRY
 pub fn fmt_err(msg: &str) -> String {
     format!("{}: {}", status_colorizer("ERROR"), msg)
+}
+
+/// simple wrapper to get the current system time as
+/// time elapsed from unix epoch
+pub fn timestamp() -> f64 {
+    let since_the_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0));
+
+    let secs = since_the_epoch.as_secs() as f64;
+    let nanos = since_the_epoch.subsec_nanos() as f64;
+
+    // Convert nanoseconds to fractional seconds and add to secs
+    secs + (nanos / 1_000_000_000.0)
 }
 
 /// given a FeroxResponse, send a TryRecursion command
@@ -139,7 +211,7 @@ pub async fn logged_request(
             Ok(resp)
         }
         Err(e) => {
-            log::warn!("err: {:?}", e);
+            log::warn!("err: {e:?}");
             scans.increment_error(url.as_str());
             bail!(e)
         }
@@ -157,10 +229,7 @@ pub async fn make_request(
     tx_stats: UnboundedSender<Command>,
 ) -> Result<Response> {
     log::trace!(
-        "enter: make_request(Configuration::Client, {}, {:?}, {:?})",
-        url,
-        output_level,
-        tx_stats
+        "enter: make_request(Configuration::Client, {url}, {output_level:?}, {tx_stats:?})"
     );
     let tmp_workaround: Option<&[u8]> = Some(&[0xd_u8, 0xa]); // \r\n
 
@@ -203,7 +272,7 @@ pub async fn make_request(
 
     match request.send().await {
         Err(e) => {
-            log::trace!("exit: make_request -> {}", e);
+            log::trace!("exit: make_request -> {e}");
 
             if e.is_timeout() {
                 send_command!(tx_stats, AddError(Timeout));
@@ -236,6 +305,10 @@ pub async fn make_request(
 
                     ferox_print(&report, &PROGRESS_PRINTER)
                 };
+            } else if is_certificate_error(&e) {
+                log::warn!("Certificate error detected: {e}");
+                send_command!(tx_stats, AddError(Certificate));
+                bail!(":SSL: {e}");
             } else if e.is_connect() {
                 send_command!(tx_stats, AddError(Connection));
             } else if e.is_request() {
@@ -244,11 +317,11 @@ pub async fn make_request(
                 send_command!(tx_stats, AddError(Other));
             }
 
-            log::warn!("Error while making request: {}", e);
+            log::warn!("Error while making request: {e}");
             bail!("{}", e)
         }
         Ok(resp) => {
-            log::trace!("exit: make_request -> {:?}", resp);
+            log::trace!("exit: make_request -> {resp:?}");
             send_command!(tx_stats, AddStatus(resp.status()));
             Ok(resp)
         }
@@ -311,7 +384,7 @@ pub fn set_open_file_limit(limit: u64) -> bool {
             // set the soft limit to our default
 
             if setrlimit(Resource::NOFILE, limit, hard).is_ok() {
-                log::debug!("set open file descriptor limit to {}", limit);
+                log::debug!("set open file descriptor limit to {limit}");
 
                 log::trace!("exit: set_open_file_limit -> {}", true);
                 return true;
@@ -320,7 +393,7 @@ pub fn set_open_file_limit(limit: u64) -> bool {
             // hard limit is lower than our default, the next best option is to set the soft limit as
             // high as the hard limit will allow
             if setrlimit(Resource::NOFILE, hard, hard).is_ok() {
-                log::debug!("set open file descriptor limit to {}", limit);
+                log::debug!("set open file descriptor limit to {limit}");
 
                 log::trace!("exit: set_open_file_limit -> {}", true);
                 return true;
@@ -330,7 +403,7 @@ pub fn set_open_file_limit(limit: u64) -> bool {
 
     // failed to set a new limit, as limit adjustments are a 'nice to have', we'll just log
     // and move along
-    log::warn!("could not set open file descriptor limit to {}", limit);
+    log::warn!("could not set open file descriptor limit to {limit}");
 
     log::trace!("exit: set_open_file_limit -> {}", false);
     false
@@ -476,7 +549,7 @@ fn should_deny_regex(url_to_test: &Url, denier: &Regex) -> bool {
 
     let result = denier.is_match(url_to_test.as_str());
 
-    log::trace!("exit: should_deny_regex -> {}", result);
+    log::trace!("exit: should_deny_regex -> {result}");
     result
 }
 
@@ -521,7 +594,7 @@ pub fn should_deny_url(url: &Url, handles: Arc<Handles>) -> Result<bool> {
 ///
 /// ex: ferox-http_telsa_com-1606947491.state
 pub fn slugify_filename(url: &str, prefix: &str, suffix: &str) -> String {
-    log::trace!("enter: slugify({:?}, {:?}, {:?})", url, prefix, suffix);
+    log::trace!("enter: slugify({url:?}, {prefix:?}, {suffix:?})");
 
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -534,11 +607,11 @@ pub fn slugify_filename(url: &str, prefix: &str, suffix: &str) -> String {
         String::new()
     };
 
-    let slug = url.replace("://", "_").replace(['/', '.'], "_");
+    let slug = url.replace("://", "_").replace(['/', '.', ':'], "_");
 
     let filename = format!("{altered_prefix}{slug}-{ts}.{suffix}");
 
-    log::trace!("exit: slugify -> {}", filename);
+    log::trace!("exit: slugify -> {filename}");
     filename
 }
 
@@ -553,7 +626,7 @@ pub fn slugify_filename(url: &str, prefix: &str, suffix: &str) -> String {
 /// /path/%2e%2e/file.html, the underlying `url::Url::parse` will
 /// further encode the %-signs and return /path/%252e%252e/file.html
 pub fn parse_url_with_raw_path(url: &str) -> Result<Url> {
-    log::trace!("enter: parse_url_with_raw_path({})", url);
+    log::trace!("enter: parse_url_with_raw_path({url})");
 
     let parsed = Url::parse(url)?;
 
@@ -561,6 +634,13 @@ pub fn parse_url_with_raw_path(url: &str) -> Result<Url> {
         // parsed correctly, but no authority, meaning mailto: or tel: or
         // some other url that we don't care about
         bail!("url to parse has no authority and is therefore invalid");
+    }
+
+    // thanks to @devx00: the possibility exists for Url to return true for
+    // has_authority, but not have a host/port, so we'll check for that
+    // and bail if it's the case
+    if parsed.host().is_none() {
+        bail!("url to parse doesn't have a host");
     }
 
     // we have a valid url, the next step is to check the path and see if it's
@@ -591,7 +671,7 @@ pub fn parse_url_with_raw_path(url: &str) -> Result<Url> {
     if let Some(port) = parsed.port() {
         // if the url has a port, then the farthest right authority component is
         // the port
-        farthest_right_authority_part = format!(":{}", port);
+        farthest_right_authority_part = format!(":{port}");
     } else if parsed.has_host() {
         // if the url has a host, then the farthest right authority component is
         // the host
@@ -648,7 +728,7 @@ pub fn parse_url_with_raw_path(url: &str) -> Result<Url> {
     // each of the following is a string that we can expect url::Url::parse to
     // transform. The variety is to ensure we cover most common path traversal
     // encodings
-    let transformation_detectors = vec![
+    let transformation_detectors = [
         // ascii
         "..",
         // single url encoded
@@ -719,7 +799,7 @@ pub fn parse_url_with_raw_path(url: &str) -> Result<Url> {
     hacked_url.set_query(parsed.query());
     hacked_url.set_fragment(parsed.fragment());
 
-    log::trace!("exit: parse_url_with_raw_path -> {}", hacked_url);
+    log::trace!("exit: parse_url_with_raw_path -> {hacked_url}");
     Ok(hacked_url)
 }
 
@@ -728,6 +808,18 @@ mod tests {
     use super::*;
     use crate::config::Configuration;
     use crate::scan_manager::{FeroxScans, ScanOrder};
+
+    #[test]
+    /// parse_url_with_raw_path with javascript:// should not throw an unimplemented! error
+    fn utils_parse_url_with_raw_path_javascript() {
+        let url = "javascript://";
+        let parsed = parse_url_with_raw_path(url);
+        assert!(parsed.is_err());
+        assert!(parsed
+            .unwrap_err()
+            .to_string()
+            .contains("url to parse doesn't have a host"));
+    }
 
     #[test]
     /// multiple tests for parse_url_with_raw_path
@@ -942,7 +1034,11 @@ mod tests {
         let tested_url = Url::parse("https://testdomain.com/denied/").unwrap();
 
         let scans = Arc::new(FeroxScans::default());
-        scans.add_directory_scan(scan_url, ScanOrder::Initial);
+        scans.add_directory_scan(
+            scan_url,
+            ScanOrder::Initial,
+            Arc::new(Handles::for_testing(None, None).0),
+        );
 
         let mut config = Configuration::new().unwrap();
         config.url_denylist = vec![Url::parse(deny_url).unwrap()];
@@ -961,7 +1057,11 @@ mod tests {
         let tested_url = Url::parse("https://testdomain.com/denied/").unwrap();
 
         let scans = Arc::new(FeroxScans::default());
-        scans.add_directory_scan(scan_url, ScanOrder::Initial);
+        scans.add_directory_scan(
+            scan_url,
+            ScanOrder::Initial,
+            Arc::new(Handles::for_testing(None, None).0),
+        );
 
         let mut config = Configuration::new().unwrap();
         config.url_denylist = vec![Url::parse(deny_url).unwrap()];
@@ -980,7 +1080,11 @@ mod tests {
         let tested_url = Url::parse("https://testdomain.com/denied/").unwrap();
 
         let scans = Arc::new(FeroxScans::default());
-        scans.add_directory_scan(scan_url, ScanOrder::Initial);
+        scans.add_directory_scan(
+            scan_url,
+            ScanOrder::Initial,
+            Arc::new(Handles::for_testing(None, None).0),
+        );
 
         let mut config = Configuration::new().unwrap();
         config.url_denylist = vec![Url::parse(deny_url).unwrap()];
@@ -1001,7 +1105,11 @@ mod tests {
         let tested_url = Url::parse("https://testdomain.com/denied/").unwrap();
 
         let scans = Arc::new(FeroxScans::default());
-        scans.add_directory_scan(scan_url, ScanOrder::Initial);
+        scans.add_directory_scan(
+            scan_url,
+            ScanOrder::Initial,
+            Arc::new(Handles::for_testing(None, None).0),
+        );
 
         let mut config = Configuration::new().unwrap();
         config.url_denylist = vec![Url::parse(deny_url).unwrap()];
@@ -1029,7 +1137,11 @@ mod tests {
         let tested_url = Url::parse("https://testdomain.com/denied/").unwrap();
 
         let scans = Arc::new(FeroxScans::default());
-        scans.add_directory_scan(scan_url, ScanOrder::Initial);
+        scans.add_directory_scan(
+            scan_url,
+            ScanOrder::Initial,
+            Arc::new(Handles::for_testing(None, None).0),
+        );
 
         let mut config = Configuration::new().unwrap();
         config.url_denylist = vec![Url::parse(deny_url).unwrap()];
@@ -1047,7 +1159,11 @@ mod tests {
         let tested_url = Url::parse("https://testdomain.com/api/denied/").unwrap();
 
         let scans = Arc::new(FeroxScans::default());
-        scans.add_directory_scan(scan_url, ScanOrder::Initial);
+        scans.add_directory_scan(
+            scan_url,
+            ScanOrder::Initial,
+            Arc::new(Handles::for_testing(None, None).0),
+        );
 
         let mut config = Configuration::new().unwrap();
         config.url_denylist = vec![Url::parse(deny_url).unwrap()];
@@ -1066,7 +1182,11 @@ mod tests {
         let tested_url = Url::parse("https://testdomain.com/not-denied/").unwrap();
 
         let scans = Arc::new(FeroxScans::default());
-        scans.add_directory_scan(scan_url, ScanOrder::Initial);
+        scans.add_directory_scan(
+            scan_url,
+            ScanOrder::Initial,
+            Arc::new(Handles::for_testing(None, None).0),
+        );
 
         let mut config = Configuration::new().unwrap();
         config.url_denylist = vec![Url::parse(deny_url).unwrap()];
@@ -1085,7 +1205,11 @@ mod tests {
         let tested_url = Url::parse("https://testdomain.com/stuff/").unwrap();
 
         let scans = Arc::new(FeroxScans::default());
-        scans.add_directory_scan(scan_url, ScanOrder::Initial);
+        scans.add_directory_scan(
+            scan_url,
+            ScanOrder::Initial,
+            Arc::new(Handles::for_testing(None, None).0),
+        );
 
         let mut config = Configuration::new().unwrap();
         config.url_denylist = vec![Url::parse(deny_url).unwrap()];
@@ -1104,7 +1228,11 @@ mod tests {
         let tested_url = Url::parse("https://testdomain.com/api/not-denied/").unwrap();
 
         let scans = Arc::new(FeroxScans::default());
-        scans.add_directory_scan(scan_url, ScanOrder::Initial);
+        scans.add_directory_scan(
+            scan_url,
+            ScanOrder::Initial,
+            Arc::new(Handles::for_testing(None, None).0),
+        );
 
         let mut config = Configuration::new().unwrap();
         config.url_denylist = vec![Url::parse(deny_url).unwrap()];
@@ -1124,7 +1252,11 @@ mod tests {
         let tested_url = Url::parse("https://testdomain.com/denied/").unwrap();
 
         let scans = Arc::new(FeroxScans::default());
-        scans.add_directory_scan(scan_url, ScanOrder::Initial);
+        scans.add_directory_scan(
+            scan_url,
+            ScanOrder::Initial,
+            Arc::new(Handles::for_testing(None, None).0),
+        );
 
         let mut config = Configuration::new().unwrap();
         config.regex_denylist = vec![Regex::new(deny_pattern).unwrap()];
@@ -1145,7 +1277,11 @@ mod tests {
         let tested_https_url = Url::parse("https://testdomain.com/denied/").unwrap();
 
         let scans = Arc::new(FeroxScans::default());
-        scans.add_directory_scan(scan_url, ScanOrder::Initial);
+        scans.add_directory_scan(
+            scan_url,
+            ScanOrder::Initial,
+            Arc::new(Handles::for_testing(None, None).0),
+        );
 
         let mut config = Configuration::new().unwrap();
         config.regex_denylist = vec![Regex::new(deny_pattern).unwrap()];

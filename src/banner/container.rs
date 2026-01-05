@@ -1,13 +1,15 @@
 use super::entry::BannerEntry;
 use crate::{
+    client,
     config::Configuration,
     event_handlers::Handles,
-    utils::{logged_request, parse_url_with_raw_path, status_colorizer},
+    utils::{make_request, parse_url_with_raw_path, status_colorizer},
     DEFAULT_IGNORED_EXTENSIONS, DEFAULT_METHOD, DEFAULT_STATUS_CODES, VERSION,
 };
 use anyhow::{bail, Result};
 use console::{style, Emoji};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::{io::Write, sync::Arc};
 
 /// Url used to query github's api; specifically used to look for the latest tagged release name
@@ -154,6 +156,9 @@ pub struct Banner {
     /// represents Configuration.url_denylist
     url_denylist: Vec<BannerEntry>,
 
+    /// represents Configuration.scope
+    scope: Vec<BannerEntry>,
+
     /// current version of feroxbuster
     pub(super) version: String,
 
@@ -174,6 +179,21 @@ pub struct Banner {
 
     /// represents Configuration.collect_words
     force_recursion: BannerEntry,
+
+    /// represents Configuration.protocol
+    protocol: BannerEntry,
+
+    /// represents Configuration.scan_dir_listings
+    scan_dir_listings: BannerEntry,
+
+    /// represents Configuration.limit_bars
+    limit_bars: BannerEntry,
+
+    /// represents Configuration.unique
+    unique: BannerEntry,
+
+    /// represents Configuration.response_size_limit
+    response_size_limit: BannerEntry,
 }
 
 /// implementation of Banner
@@ -182,6 +202,7 @@ impl Banner {
     pub fn new(tgts: &[String], config: &Configuration) -> Self {
         let mut targets = Vec::new();
         let mut url_denylist = Vec::new();
+        let mut scope = Vec::new();
         let mut code_filters = Vec::new();
         let mut replay_codes = Vec::new();
         let mut headers = Vec::new();
@@ -210,6 +231,15 @@ impl Banner {
                 "Don't Scan Regex",
                 denied_regex.as_str(),
             ));
+        }
+
+        for scope_url in &config.scope {
+            let value = match scope_url.host() {
+                Some(host) => host.to_string(),
+                None => scope_url.as_str().to_string(),
+            };
+
+            scope.push(BannerEntry::new("🚩", "In-Scope Url", &value));
         }
 
         // the +2 is for the 2 experimental status codes we add to the default list manually
@@ -318,6 +348,12 @@ impl Banner {
             BannerEntry::new("🚫", "Do Not Recurse", &config.no_recursion.to_string())
         };
 
+        let protocol = if config.protocol.to_lowercase() == "http" {
+            BannerEntry::new("🔓", "Default Protocol", &config.protocol)
+        } else {
+            BannerEntry::new("🔒", "Default Protocol", &config.protocol)
+        };
+
         let scan_limit = BannerEntry::new(
             "🦥",
             "Concurrent Scan Limit",
@@ -329,6 +365,11 @@ impl Banner {
         let replay_proxy = BannerEntry::new("🎥", "Replay Proxy", &config.replay_proxy);
         let auto_tune = BannerEntry::new("🎶", "Auto Tune", &config.auto_tune.to_string());
         let auto_bail = BannerEntry::new("🙅", "Auto Bail", &config.auto_bail.to_string());
+        let scan_dir_listings = BannerEntry::new(
+            "📂",
+            "Scan Dir Listings",
+            &config.scan_dir_listings.to_string(),
+        );
         let cfg = BannerEntry::new("💉", "Config File", &config.config);
         let proxy = BannerEntry::new("💎", "Proxy", &config.proxy);
         let server_certs = BannerEntry::new(
@@ -339,6 +380,8 @@ impl Banner {
         let client_cert = BannerEntry::new("🏅", "Client Certificate", &config.client_cert);
         let client_key = BannerEntry::new("🔑", "Client Key", &config.client_key);
         let threads = BannerEntry::new("🚀", "Threads", &config.threads.to_string());
+        let limit_bars =
+            BannerEntry::new("📊", "Limit Dir Scan Bars", &config.limit_bars.to_string());
         let wordlist = BannerEntry::new("📖", "Wordlist", &config.wordlist);
         let timeout = BannerEntry::new("💥", "Timeout (secs)", &config.timeout.to_string());
         let user_agent = BannerEntry::new("🦡", "User-Agent", &config.user_agent);
@@ -405,6 +448,14 @@ impl Banner {
         let collect_words =
             BannerEntry::new("🤑", "Collect Words", &config.collect_words.to_string());
 
+        let unique = BannerEntry::new("🎲", "Unique Responses", &config.unique.to_string());
+
+        let response_size_limit = BannerEntry::new(
+            "📏",
+            "Response Size Limit",
+            &format!("{} bytes", config.response_size_limit),
+        );
+
         Self {
             targets,
             status_codes,
@@ -448,11 +499,17 @@ impl Banner {
             force_recursion,
             time_limit,
             url_denylist,
+            scope,
             collect_extensions,
             collect_backups,
             collect_words,
             dont_collect,
             config: cfg,
+            scan_dir_listings,
+            protocol,
+            limit_bars,
+            unique,
+            response_size_limit,
             version: VERSION.to_string(),
             update_status: UpdateStatus::Unknown,
         }
@@ -494,11 +551,56 @@ by Ben "epi" Risher {}                 ver: {}"#,
     ///
     /// ex: v1.1.0
     pub async fn check_for_updates(&mut self, url: &str, handles: Arc<Handles>) -> Result<()> {
-        log::trace!("enter: needs_update({}, {:?})", url, handles);
+        log::trace!("enter: needs_update({url}, {handles:?})");
 
         let api_url = parse_url_with_raw_path(url)?;
 
-        let result = logged_request(&api_url, DEFAULT_METHOD, None, handles.clone()).await?;
+        // we don't want to leak sensitive header info / include auth headers
+        // with the github api request, so we'll build a client specifically
+        // for this task. thanks to @stuhlmann for the suggestion!
+        let headers = HashMap::new();
+        let client_cert = if handles.config.client_cert.is_empty() {
+            None
+        } else {
+            Some(handles.config.client_cert.as_str())
+        };
+        let client_key = if handles.config.client_key.is_empty() {
+            None
+        } else {
+            Some(handles.config.client_key.as_str())
+        };
+        let proxy = if handles.config.proxy.is_empty() {
+            None
+        } else {
+            Some(handles.config.proxy.as_str())
+        };
+        let client_config = client::ClientConfig {
+            timeout: handles.config.timeout,
+            user_agent: "feroxbuster-update-check",
+            redirects: handles.config.redirects,
+            insecure: handles.config.insecure,
+            headers: &headers,
+            proxy,
+            server_certs: Some(&handles.config.server_certs),
+            client_cert,
+            client_key,
+            scope: &handles.config.scope,
+        };
+        let client = client::initialize(client_config)?;
+        let level = handles.config.output_level;
+        let tx_stats = handles.stats.tx.clone();
+
+        let result = make_request(
+            &client,
+            &api_url,
+            DEFAULT_METHOD,
+            None,
+            level,
+            &handles.config,
+            tx_stats,
+        )
+        .await?;
+
         let body = result.text().await?;
 
         let json_response: Value = serde_json::from_str(&body)?;
@@ -506,7 +608,7 @@ by Ben "epi" Risher {}                 ver: {}"#,
         let latest_version = match json_response["tag_name"].as_str() {
             Some(tag) => tag.trim_start_matches('v'),
             None => {
-                bail!("JSON has no tag_name: {}", json_response);
+                bail!("JSON has no tag_name: {json_response}");
             }
         };
 
@@ -546,6 +648,10 @@ by Ben "epi" Risher {}                 ver: {}"#,
             writeln!(&mut writer, "{denied_url}")?;
         }
 
+        for scoped_url in &self.scope {
+            writeln!(&mut writer, "{scoped_url}")?;
+        }
+
         writeln!(&mut writer, "{}", self.threads)?;
         writeln!(&mut writer, "{}", self.wordlist)?;
 
@@ -566,6 +672,14 @@ by Ben "epi" Risher {}                 ver: {}"#,
         }
 
         // followed by the maybe printed or variably displayed values
+        if !config.request_file.is_empty() {
+            writeln!(&mut writer, "{}", self.protocol)?;
+        }
+
+        if config.limit_bars > 0 {
+            writeln!(&mut writer, "{}", self.limit_bars)?;
+        }
+
         if !config.config.is_empty() {
             writeln!(&mut writer, "{}", self.config)?;
         }
@@ -631,6 +745,10 @@ by Ben "epi" Risher {}                 ver: {}"#,
 
         if !config.output.is_empty() {
             writeln!(&mut writer, "{}", self.output)?;
+        }
+
+        if config.scan_dir_listings {
+            writeln!(&mut writer, "{}", self.scan_dir_listings)?;
         }
 
         if !config.debug_log.is_empty() {
@@ -710,6 +828,14 @@ by Ben "epi" Risher {}                 ver: {}"#,
 
         if !config.time_limit.is_empty() {
             writeln!(&mut writer, "{}", self.time_limit)?;
+        }
+
+        if config.unique {
+            writeln!(&mut writer, "{}", self.unique)?;
+        }
+
+        if config.response_size_limit != 4194304 {
+            writeln!(&mut writer, "{}", self.response_size_limit)?;
         }
 
         if matches!(self.update_status, UpdateStatus::OutOfDate) {
