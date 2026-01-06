@@ -1,8 +1,9 @@
-feroxbuster (2.13.1-0parrot2) UNRELEASED; urgency=medium
+feroxbuster (2.13.1-0parrot2) echo; urgency=medium
 
+  [ Leonardo "антракс_99" Tito ]
   * Update VCS fields to point to official parrotsec repository
 
- -- Leonardo "антракс_99" Tito <leotito201@outlook.com>  Tue, 06 Jan 2026 02:19:50 -0300
+ -- Leonardo "антракс_99" Tito <leotito201@outlook.com> Tue, 06 Jan 14:11:01 -0300
 
 feroxbuster (2.13.1-0parrot1) echo; urgency=medium
 

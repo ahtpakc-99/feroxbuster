@@ -11,7 +11,7 @@ Build-Depends: ca-certificates,
                libssl-dev
 Standards-Version: 4.6.2
 Vcs-Browser: https://gitlab.com/parrotsec/packages/feroxbuster
-Vcs-Git: https://gitlab.com/parrotsec/packages/feroxbuster
+Vcs-Git: https://gitlab.com/parrotsec/packages/feroxbuster.git
 Homepage: https://github.com/epi052/feroxbuster
 Rules-Requires-Root: no
 
